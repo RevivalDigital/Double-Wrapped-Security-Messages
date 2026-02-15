@@ -1,21 +1,133 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import PocketBase from "pocketbase";
+import * as CryptoJS from "crypto-js";
 
-const pb = new PocketBase(process.env.NEXT_PUBLIC_PB_URL);
+const PB_URL = process.env.NEXT_PUBLIC_PB_URL || "";
+const pb = new PocketBase(PB_URL);
+
+const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "";
+const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "";
+const INTERNAL_APP_KEY = KEY1 + KEY2;
 
 export default function ChatPage() {
   const [myUser, setMyUser] = useState<any>(null);
   const [friends, setFriends] = useState<any[]>([]);
+  const [requests, setRequests] = useState<any[]>([]);
   const [activeChat, setActiveChat] = useState<any>(null);
   const [messages, setMessages] = useState<any[]>([]);
-  const [text, setText] = useState("");
-  const [notifications, setNotifications] = useState<any[]>([]);
-  const [unreadCount, setUnreadCount] = useState(0);
-  const [showNotif, setShowNotif] = useState(false);
+  const [inputText, setInputText] = useState("");
+  const [searchId, setSearchId] = useState("");
+  const [showNoti, setShowNoti] = useState(false);
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
 
-  // ================= INIT =================
+  const chatBoxRef = useRef<HTMLDivElement>(null);
+  const activeChatRef = useRef<any>(null);
+  const currentChatKeyRef = useRef<string>("");
+
+  // ================= ENCRYPTION =================
+
+  const encryptSalt = (raw: string) =>
+    CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
+
+  const decryptSalt = (enc: string) => {
+    if (!enc) return null;
+    try {
+      const bytes = CryptoJS.AES.decrypt(enc, INTERNAL_APP_KEY);
+      return bytes.toString(CryptoJS.enc.Utf8) || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const generateChatKey = (id1: string, id2: string, salt: string) => {
+    const combined = [id1, id2].sort().join("");
+    return CryptoJS.SHA256(
+      combined + salt + INTERNAL_APP_KEY
+    ).toString();
+  };
+
+  // ================= LOAD FRIENDS =================
+
+  const loadFriends = async () => {
+    const myId = pb.authStore.model?.id;
+    if (!myId) return;
+
+    const records = await pb.collection("friends").getFullList({
+      expand: "user,friend",
+      filter: `user="${myId}" || friend="${myId}"`,
+      sort: "-updated",
+    });
+
+    setFriends(records.filter((r) => r.status === "accepted"));
+    setRequests(
+      records.filter(
+        (r) => r.status === "pending" && r.friend === myId
+      )
+    );
+  };
+
+  // ================= LOAD MESSAGES =================
+
+  const loadMessages = async (friendRecord: any) => {
+    if (!myUser) return;
+
+    const friendData =
+      friendRecord.user === myUser.id
+        ? friendRecord.expand.friend
+        : friendRecord.expand.user;
+
+    const salt =
+      decryptSalt(friendRecord.chat_salt) || "fallback";
+
+    const key = generateChatKey(
+      myUser.id,
+      friendData.id,
+      salt
+    );
+
+    currentChatKeyRef.current = key;
+    activeChatRef.current = friendData;
+    setActiveChat(friendData);
+
+    const res = await pb.collection("messages").getFullList({
+      filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
+      sort: "created",
+    });
+
+    setMessages(res);
+
+    // reset unread count
+    setUnreadCounts((prev) => {
+      const copy = { ...prev };
+      delete copy[friendData.id];
+      return copy;
+    });
+  };
+
+  // ================= SEND MESSAGE =================
+
+  const sendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputText.trim() || !activeChatRef.current) return;
+
+    const encrypted = CryptoJS.AES.encrypt(
+      inputText.trim(),
+      currentChatKeyRef.current
+    ).toString();
+
+    await pb.collection("messages").create({
+      sender: myUser.id,
+      receiver: activeChatRef.current.id,
+      text: encrypted,
+    });
+
+    setInputText("");
+  };
+
+  // ================= REALTIME INIT (ONCE ONLY) =================
+
   useEffect(() => {
     if (!pb.authStore.isValid) {
       window.location.href = "/login";
@@ -24,9 +136,7 @@ export default function ChatPage() {
 
     const user = pb.authStore.model;
     setMyUser(user);
-
     loadFriends();
-    loadNotifications();
 
     if ("Notification" in window) {
       Notification.requestPermission();
@@ -43,128 +153,98 @@ export default function ChatPage() {
       const myId = pb.authStore.model?.id;
       if (!myId) return;
 
-      if (msg.receiver === myId && msg.sender !== myId) {
-        await pb.collection("notifications").create({
-          user: myId,
-          type: "message",
-          title: "Pesan Baru",
-          message: "Kamu menerima pesan baru",
-          is_read: false,
-          related_id: msg.id,
-        });
+      const active = activeChatRef.current;
 
-        if (Notification.permission === "granted") {
-          new Notification("Pesan Baru", {
-            body: "Kamu menerima pesan baru",
-          });
-        }
+      const isRelevant =
+        active &&
+        ((msg.sender === myId &&
+          msg.receiver === active.id) ||
+          (msg.sender === active.id &&
+            msg.receiver === myId));
+
+      if (isRelevant) {
+        setMessages((prev) => [...prev, msg]);
       }
 
       if (
-        activeChat &&
-        ((msg.sender === myId && msg.receiver === activeChat.id) ||
-          (msg.receiver === myId && msg.sender === activeChat.id))
+        msg.receiver === myId &&
+        (!active || msg.sender !== active.id)
       ) {
-        setMessages((prev) => [...prev, msg]);
-      }
-    });
+        setUnreadCounts((prev) => ({
+          ...prev,
+          [msg.sender]: (prev[msg.sender] || 0) + 1,
+        }));
 
-    pb.collection("notifications").subscribe("*", (e) => {
-      if (e.record.user === pb.authStore.model?.id) {
-        loadNotifications();
+        if (Notification.permission === "granted") {
+          new Notification("Pesan Baru", {
+            body: "Pesan rahasia baru",
+          });
+        }
       }
     });
 
     return () => {
       pb.collection("friends").unsubscribe();
       pb.collection("messages").unsubscribe();
-      pb.collection("notifications").unsubscribe();
     };
-  }, [activeChat]);
+  }, []);
 
-  // ================= LOADERS =================
-
-  const loadFriends = async () => {
-    const user = pb.authStore.model;
-    if (!user) return;
-
-    const res = await pb.collection("friends").getFullList({
-      filter: `user="${user.id}"`,
-      expand: "friend",
-    });
-
-    setFriends(res);
-  };
-
-  const loadMessages = async (friendId: string) => {
-    const myId = pb.authStore.model?.id;
-    if (!myId) return;
-
-    const res = await pb.collection("messages").getFullList({
-      filter: `(sender="${myId}" && receiver="${friendId}") || (sender="${friendId}" && receiver="${myId}")`,
-      sort: "created",
-    });
-
-    setMessages(res);
-  };
-
-  const loadNotifications = async () => {
-    const user = pb.authStore.model;
-    if (!user) return;
-
-    const res = await pb.collection("notifications").getFullList({
-      filter: `user="${user.id}"`,
-      sort: "-created",
-    });
-
-    setNotifications(res);
-    setUnreadCount(res.filter((n) => !n.is_read).length);
-  };
-
-  // ================= SEND =================
-
-  const sendMessage = async () => {
-    if (!text.trim() || !activeChat) return;
-
-    const myId = pb.authStore.model?.id;
-
-    await pb.collection("messages").create({
-      sender: myId,
-      receiver: activeChat.id,
-      content: text,
-    });
-
-    setText("");
-  };
+  useEffect(() => {
+    if (chatBoxRef.current)
+      chatBoxRef.current.scrollTop =
+        chatBoxRef.current.scrollHeight;
+  }, [messages]);
 
   // ================= UI =================
 
+  if (!myUser)
+    return (
+      <div className="h-screen flex items-center justify-center">
+        Initializing...
+      </div>
+    );
+
   return (
-    <div className="flex h-screen bg-[#020817] text-white">
-
+    <div className="flex h-screen bg-black text-white">
       {/* SIDEBAR */}
-      <div className="w-72 border-r border-gray-800 flex flex-col">
+      <aside className="w-80 border-r border-gray-800 flex flex-col">
+        <div className="p-4 font-bold">Bitlab Chat</div>
 
-        <div className="p-4 font-bold text-lg">BITLAB CHAT</div>
+        <div className="flex-1 overflow-y-auto px-2 space-y-1">
+          {friends.map((f) => {
+            const friendData =
+              f.user === myUser.id
+                ? f.expand?.friend
+                : f.expand?.user;
 
-        <div className="flex-1 overflow-y-auto">
-          {friends.map((f) => (
-            <div
-              key={f.id}
-              onClick={() => {
-                setActiveChat(f.expand.friend);
-                loadMessages(f.expand.friend.id);
-              }}
-              className="p-4 cursor-pointer hover:bg-gray-800"
-            >
-              {f.expand.friend.username}
-            </div>
-          ))}
+            const unread = unreadCounts[friendData?.id] || 0;
+
+            return (
+              <button
+                key={f.id}
+                onClick={() => loadMessages(f)}
+                className="w-full p-2 flex justify-between hover:bg-gray-800 rounded"
+              >
+                <span>
+                  {friendData?.name ||
+                    friendData?.username ||
+                    friendData?.email}
+                </span>
+                {unread > 0 && (
+                  <span className="bg-red-500 text-xs px-2 rounded-full">
+                    {unread}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
 
         {/* PROFILE */}
-        <div className="border-t border-gray-800 p-4">
-          <p className="font-semibold">{myUser?.username}</p>
+        <div className="p-4 border-t border-gray-800">
+          <p className="font-semibold">
+            {myUser.username || myUser.email}
+          </p>
           <button
             className="text-red-400 text-sm mt-1"
             onClick={() => {
@@ -175,91 +255,55 @@ export default function ChatPage() {
             Logout
           </button>
         </div>
-      </div>
+      </aside>
 
       {/* CHAT AREA */}
-      <div className="flex-1 flex flex-col relative">
-
-        {/* HEADER */}
-        <div className="flex justify-between items-center p-4 border-b border-gray-800">
-          <div className="font-semibold">
-            {activeChat ? activeChat.username : "Pilih Chat"}
-          </div>
-
-          {/* BELL */}
-          <div className="relative cursor-pointer" onClick={() => setShowNotif(!showNotif)}>
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              className="w-5 h-5"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6 6 0 10-12 0v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
-              />
-            </svg>
-
-            {unreadCount > 0 && (
-              <span className="absolute -top-2 -right-2 bg-red-500 text-xs px-2 rounded-full">
-                {unreadCount}
-              </span>
-            )}
-
-            {showNotif && (
-              <div className="absolute right-0 top-8 w-72 bg-[#0f172a] border border-gray-700 rounded-lg p-3 z-50">
-                {notifications.length === 0 && (
-                  <p className="text-sm text-gray-400">
-                    Tidak ada notifikasi
-                  </p>
-                )}
-
-                {notifications.map((n) => (
-                  <div
-                    key={n.id}
-                    className={`p-2 rounded-md mb-2 cursor-pointer ${
-                      n.is_read ? "" : "bg-gray-800"
-                    }`}
-                    onClick={async () => {
-                      await pb.collection("notifications").update(n.id, {
-                        is_read: true,
-                      });
-                      loadNotifications();
-                    }}
-                  >
-                    <p className="text-sm font-semibold">{n.title}</p>
-                    <p className="text-xs text-gray-400">{n.message}</p>
-                    <p className="text-[10px] text-gray-500">
-                      {new Date(n.created).toLocaleString()}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+      <main className="flex-1 flex flex-col">
+        <div className="p-4 border-b border-gray-800 font-semibold">
+          {activeChat
+            ? activeChat.name || activeChat.email
+            : "Pilih Chat"}
         </div>
 
-        {/* MESSAGES */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+        <div
+          ref={chatBoxRef}
+          className="flex-1 overflow-y-auto p-4 space-y-3"
+        >
           {messages.map((msg) => {
-            const isMe = msg.sender === myUser?.id;
+            let plain = "";
+            try {
+              const bytes = CryptoJS.AES.decrypt(
+                msg.text,
+                currentChatKeyRef.current
+              );
+              plain =
+                bytes.toString(CryptoJS.enc.Utf8) ||
+                "🔒 Decrypt Error";
+            } catch {
+              plain = "🔒 Decrypt Error";
+            }
+
+            const isMe = msg.sender === myUser.id;
 
             return (
               <div
                 key={msg.id}
-                className={`flex ${isMe ? "justify-end" : "justify-start"}`}
+                className={`flex ${
+                  isMe ? "justify-end" : "justify-start"
+                }`}
               >
                 <div
                   className={`max-w-xs px-4 py-2 rounded-xl ${
-                    isMe ? "bg-blue-600" : "bg-gray-800"
+                    isMe
+                      ? "bg-blue-600"
+                      : "bg-gray-800"
                   }`}
                 >
-                  <p>{msg.content}</p>
+                  <p>{plain}</p>
                   <div className="text-xs text-gray-300 mt-1 text-right">
-                    {new Date(msg.created).toLocaleTimeString([], {
+                    {new Date(
+                      msg.created
+                    ).toLocaleTimeString([], {
                       hour: "2-digit",
                       minute: "2-digit",
                     })}
@@ -270,37 +314,25 @@ export default function ChatPage() {
           })}
         </div>
 
-        {/* INPUT */}
         {activeChat && (
-          <div className="p-4 border-t border-gray-800 flex gap-2">
+          <form
+            onSubmit={sendMessage}
+            className="p-4 border-t border-gray-800 flex gap-2"
+          >
             <input
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              placeholder="Type an encrypted message..."
-              className="flex-1 bg-[#0f172a] border border-gray-700 rounded-full px-4 py-2 outline-none"
+              value={inputText}
+              onChange={(e) =>
+                setInputText(e.target.value)
+              }
+              className="flex-1 bg-gray-900 border border-gray-700 rounded-full px-4 py-2"
+              placeholder="Type message..."
             />
-            <button
-              onClick={sendMessage}
-              className="bg-blue-600 p-2 rounded-full"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                className="w-4 h-4"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="white"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M5 12h14M12 5l7 7-7 7"
-                />
-              </svg>
+            <button className="bg-blue-600 px-4 rounded-full">
+              Send
             </button>
-          </div>
+          </form>
         )}
-      </div>
+      </main>
     </div>
   );
 }

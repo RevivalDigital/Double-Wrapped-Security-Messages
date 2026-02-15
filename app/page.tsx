@@ -233,6 +233,8 @@ export default function ChatPage() {
             if (e.action === 'create') {
                 const msg = e.record;
                 const myId = pb.authStore.model?.id;
+                if (!myId) return; // Guard clause
+                
                 const isForMe = msg.receiver === myId;
                 const isFromMe = msg.sender === myId;
                 const isFromActive = activeChat && msg.sender === activeChat.id;
@@ -243,7 +245,7 @@ export default function ChatPage() {
                         const updated = [...prev, msg];
                         
                         // Update cache dengan pesan baru
-                        if (activeChat) {
+                        if (activeChat && myId) {
                             saveMessagesToCache(myId, activeChat.id, updated);
                         }
                         
@@ -281,6 +283,8 @@ export default function ChatPage() {
     }, [messages]);
 
     const selectChat = async (friendRecord: any) => {
+        if (!myUser?.id) return; // Guard clause untuk TypeScript
+        
         setLoadingMessages(true);
         
         const friendData = friendRecord.user === myUser.id ? friendRecord.expand.friend : friendRecord.expand.user;

@@ -14,13 +14,9 @@ const INTERNAL_APP_KEY = KEY1 + KEY2;
 export default function ChatPage() {
   const [myUser, setMyUser] = useState<any>(null);
   const [friends, setFriends] = useState<any[]>([]);
-  const [requests, setRequests] = useState<any[]>([]);
   const [activeChat, setActiveChat] = useState<any>(null);
   const [messages, setMessages] = useState<any[]>([]);
   const [inputText, setInputText] = useState("");
-  const [searchId, setSearchId] = useState("");
-  const [showNoti, setShowNoti] = useState(false);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [loadingMessages, setLoadingMessages] = useState(false);
 
@@ -28,9 +24,6 @@ export default function ChatPage() {
   const currentChatKeyRef = useRef<string>("");
 
   // ================= ENCRYPTION =================
-
-  const encryptSalt = (raw: string) =>
-    CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
 
   const decryptSalt = (enc: string) => {
     if (!enc) return null;
@@ -49,50 +42,51 @@ export default function ChatPage() {
     ).toString();
   };
 
-  // ================= LOAD NOTIFICATIONS =================
-
-  const loadNotifications = async () => {
-    try {
-      const myId = pb.authStore.model?.id;
-      if (!myId) return;
-
-      const result = await pb.collection("notifications").getFullList({
-        filter: `user="${myId}" && is_read=false`,
-      });
-
-      const grouped: Record<string, number> = {};
-      result.forEach((n: any) => {
-        grouped[n.sender] = (grouped[n.sender] || 0) + 1;
-      });
-
-      setUnreadCounts(grouped);
-    } catch (err) {
-      console.error("Load notification error:", err);
-    }
-  };
-
   // ================= LOAD FRIENDS =================
 
   const loadFriends = async () => {
-    try {
-      const userId = pb.authStore.model?.id;
-      if (!userId) return;
+    const userId = pb.authStore.model?.id;
+    if (!userId) return;
 
-      const records = await pb.collection("friends").getFullList({
-        expand: "user,friend",
-        filter: `user="${userId}" || friend="${userId}"`,
-        sort: "-updated",
+    const records = await pb.collection("friends").getFullList({
+      expand: "user,friend",
+      filter: `user="${userId}" || friend="${userId}"`,
+      sort: "-updated",
+    });
+
+    const accepted = records.filter((r) => r.status === "accepted");
+    setFriends(accepted);
+
+    await loadUnreadCounts(accepted);
+  };
+
+  const loadUnreadCounts = async (friendRecords: any[]) => {
+    const myId = pb.authStore.model?.id;
+    if (!myId) return;
+
+    const counts: Record<string, number> = {};
+
+    for (const f of friendRecords) {
+      const friendData =
+        f.user === myId ? f.expand?.friend : f.expand?.user;
+
+      const lastRead =
+        f.user === myId ? f.last_read_user : f.last_read_friend;
+
+      const filter = lastRead
+        ? `sender="${friendData.id}" && receiver="${myId}" && created>"${lastRead}"`
+        : `sender="${friendData.id}" && receiver="${myId}"`;
+
+      const result = await pb.collection("messages").getList(1, 1, {
+        filter,
       });
 
-      setFriends(records.filter((r) => r.status === "accepted"));
-      setRequests(
-        records.filter(
-          (r) => r.status === "pending" && r.friend === userId
-        )
-      );
-    } catch (err) {
-      console.error(err);
+      if (result.totalItems > 0) {
+        counts[friendData.id] = result.totalItems;
+      }
     }
+
+    setUnreadCounts(counts);
   };
 
   // ================= REALTIME =================
@@ -103,19 +97,10 @@ export default function ChatPage() {
       return;
     }
 
-    const init = async () => {
-      setMyUser(pb.authStore.model);
-      await loadFriends();
-      await loadNotifications();
-    };
+    setMyUser(pb.authStore.model);
+    loadFriends();
 
-    init();
-
-    if ("Notification" in window) {
-      Notification.requestPermission();
-    }
-
-    pb.collection("friends").subscribe("*", () => loadFriends());
+    pb.collection("friends").subscribe("*", loadFriends);
 
     pb.collection("messages").subscribe("*", async (e) => {
       if (e.action !== "create") return;
@@ -123,25 +108,6 @@ export default function ChatPage() {
       const msg = e.record;
       const myId = pb.authStore.model?.id;
       if (!myId) return;
-
-      const isForMe = msg.receiver === myId;
-
-      if (isForMe) {
-        try {
-          await pb.collection("notifications").create({
-            user: myId,
-            sender: msg.sender,
-            title: "Pesan Baru",
-            message: "Kamu menerima pesan baru",
-            is_read: false,
-            related_id: msg.id,
-          });
-        } catch (err) {
-          console.error("Save notification error:", err);
-        }
-
-        await loadNotifications();
-      }
 
       if (
         activeChat &&
@@ -152,18 +118,15 @@ export default function ChatPage() {
       ) {
         setMessages((prev) => [...prev, msg]);
       }
-    });
 
-    pb.collection("notifications").subscribe("*", () =>
-      loadNotifications()
-    );
+      loadFriends();
+    });
 
     return () => {
       pb.collection("friends").unsubscribe();
       pb.collection("messages").unsubscribe();
-      pb.collection("notifications").unsubscribe();
     };
-  }, []);
+  }, [activeChat]);
 
   useEffect(() => {
     if (chatBoxRef.current)
@@ -184,15 +147,15 @@ export default function ChatPage() {
         ? friendRecord.expand?.friend
         : friendRecord.expand?.user;
 
-    if (!friendData) return;
-
     const salt =
       decryptSalt(friendRecord.chat_salt) || "fallback";
+
     const key = generateChatKey(
       myUser.id,
       friendData.id,
       salt
     );
+
     currentChatKeyRef.current = key;
     setActiveChat(friendData);
 
@@ -202,14 +165,15 @@ export default function ChatPage() {
     });
 
     setMessages(res);
+
+    const isUserFirst = friendRecord.user === myUser.id;
+    await pb.collection("friends").update(friendRecord.id, {
+      [isUserFirst ? "last_read_user" : "last_read_friend"]:
+        new Date().toISOString(),
+    });
+
     setLoadingMessages(false);
-
-    await pb.collection("notifications").update(
-      undefined,
-      { is_read: true }
-    );
-
-    await loadNotifications();
+    loadFriends();
   };
 
   // ================= SEND MESSAGE =================
@@ -243,24 +207,8 @@ export default function ChatPage() {
     <div className="flex h-screen bg-background text-foreground">
       {/* SIDEBAR */}
       <aside className="w-80 border-r border-border flex flex-col">
-        <div className="p-4 font-bold flex justify-between">
+        <div className="p-4 font-bold">
           Bitlab Chat
-          <div className="relative">
-            <button onClick={() => setShowNoti(!showNoti)}>
-              🔔
-            </button>
-            {Object.values(unreadCounts).reduce(
-              (a, b) => a + b,
-              0
-            ) > 0 && (
-              <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs px-2 rounded-full">
-                {Object.values(unreadCounts).reduce(
-                  (a, b) => a + b,
-                  0
-                )}
-              </span>
-            )}
-          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto px-2">
@@ -270,29 +218,36 @@ export default function ChatPage() {
                 ? f.expand?.friend
                 : f.expand?.user;
 
-            if (!friendData) return null;
+            const unread =
+              unreadCounts[friendData?.id] || 0;
 
             return (
               <button
                 key={f.id}
                 onClick={() => selectChat(f)}
-                className="w-full p-2 hover:bg-accent rounded text-left"
+                className="w-full p-3 hover:bg-accent rounded text-left flex justify-between items-center"
               >
-                {friendData.name ||
-                  friendData.username ||
-                  friendData.email}
+                <span>
+                  {friendData.name ||
+                    friendData.username ||
+                    friendData.email}
+                </span>
+
+                {unread > 0 && (
+                  <span className="bg-red-500 text-white text-xs px-2 rounded-full">
+                    {unread}
+                  </span>
+                )}
               </button>
             );
           })}
         </div>
 
-        {/* PROFILE */}
+        {/* PROFILE LINK */}
         <div className="p-4 border-t border-border">
-          <button
-            onClick={() =>
-              (window.location.href = "/profile")
-            }
-            className="w-full flex items-center gap-2"
+          <a
+            href="/profile"
+            className="flex items-center gap-3 hover:bg-accent p-2 rounded"
           >
             {myUser.avatar ? (
               <img
@@ -300,20 +255,24 @@ export default function ChatPage() {
                 className="w-8 h-8 rounded-full"
               />
             ) : (
-              <div className="w-8 h-8 bg-primary rounded-full flex items-center justify-center text-xs">
+              <div className="w-8 h-8 bg-primary text-white rounded-full flex items-center justify-center text-xs">
                 {(myUser.name || "U")[0]}
               </div>
             )}
-            <span>
-              {myUser.name ||
-                myUser.username ||
-                myUser.email}
-            </span>
-          </button>
+
+            <div>
+              <div className="font-semibold">
+                {myUser.name || myUser.username}
+              </div>
+              <div className="text-xs opacity-60">
+                View / Edit Profile
+              </div>
+            </div>
+          </a>
         </div>
       </aside>
 
-      {/* CHAT */}
+      {/* CHAT AREA */}
       <main className="flex-1 flex flex-col">
         <div className="p-4 border-b border-border font-semibold">
           {activeChat
@@ -334,27 +293,24 @@ export default function ChatPage() {
               );
               plain =
                 bytes.toString(CryptoJS.enc.Utf8) ||
-                "🔒 Decrypt Error";
+                "🔒 Error";
             } catch {
-              plain = "🔒 Decrypt Error";
+              plain = "🔒 Error";
             }
 
-            const isMe = msg.sender === myUser.id;
+            const isMe =
+              msg.sender === myUser.id;
 
             return (
               <div
                 key={msg.id}
                 className={`flex ${
-                  isMe ? "justify-end" : "justify-start"
+                  isMe
+                    ? "justify-end"
+                    : "justify-start"
                 }`}
               >
-                <div
-                  className={`px-4 py-2 rounded-xl ${
-                    isMe
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-card border border-border"
-                  }`}
-                >
+                <div className="px-4 py-2 rounded-xl bg-card border">
                   <p>{plain}</p>
                   <span className="text-xs opacity-50">
                     {new Date(

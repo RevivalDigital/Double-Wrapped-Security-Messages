@@ -22,6 +22,7 @@ export default function ChatPage() {
     const [showNoti, setShowNoti] = useState(false);
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
     const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+    const [loadingMessages, setLoadingMessages] = useState(false);
     
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
@@ -177,6 +178,8 @@ export default function ChatPage() {
     }, [messages]);
 
     const selectChat = async (friendRecord: any) => {
+        setLoadingMessages(true);
+        
         const friendData = friendRecord.user === myUser.id ? friendRecord.expand.friend : friendRecord.expand.user;
         const salt = decryptSalt(friendRecord.chat_salt) || "fallback";
         const key = generateChatKey(myUser.id, friendData.id, salt);
@@ -202,11 +205,22 @@ export default function ChatPage() {
             console.error('Error updating last_read:', err);
         }
         
-        const res = await pb.collection('messages').getFullList({
-            filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
-            sort: 'created'
-        });
-        setMessages(res);
+        try {
+            // Load 50 pesan terbaru untuk performa lebih baik
+            const res = await pb.collection('messages').getList(1, 50, {
+                filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
+                sort: '-created' // Descending (terbaru dulu)
+            });
+            
+            // Reverse agar pesan lama di atas, baru di bawah
+            setMessages(res.items.reverse());
+        } catch (err) {
+            console.error('Error loading messages:', err);
+            setMessages([]);
+        } finally {
+            setLoadingMessages(false);
+        }
+        
         if (window.innerWidth < 768) setIsSidebarOpen(false);
     };
 
@@ -245,7 +259,7 @@ export default function ChatPage() {
                     <button onClick={() => setShowNoti(!showNoti)} className="relative p-2 hover:bg-accent rounded-md">
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>
                         {(requests.length > 0 || getTotalUnread() > 0) && (
-                            <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] bg-primary text-primary-foreground rounded-full flex items-center justify-center text-[9px] font-bold px-1">
+                            <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[10px] font-bold px-1 shadow-lg animate-pulse">
                                 {requests.length + getTotalUnread()}
                             </span>
                         )}
@@ -287,7 +301,7 @@ export default function ChatPage() {
                                 <div className="relative">
                                     <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">{(friendData?.name || 'U')[0].toUpperCase()}</div>
                                     {unreadCount > 0 && (
-                                        <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] bg-primary text-primary-foreground rounded-full flex items-center justify-center text-[8px] font-bold px-1">
+                                        <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] font-bold px-1 shadow-lg border-2 border-card">
                                             {unreadCount}
                                         </span>
                                     )}
@@ -295,7 +309,7 @@ export default function ChatPage() {
                                 <div className="text-left truncate flex-1">
                                     <div className="text-sm font-semibold truncate">{friendData?.name || friendData?.username || friendData?.email}</div>
                                     {unreadCount > 0 ? (
-                                        <p className="text-[10px] text-primary font-bold">{unreadCount} pesan baru</p>
+                                        <p className="text-[10px] text-red-500 font-bold">{unreadCount} pesan baru</p>
                                     ) : (
                                         <p className="text-[10px] text-emerald-500 font-bold flex items-center gap-1"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" /> Secured Session</p>
                                     )}
@@ -359,7 +373,19 @@ export default function ChatPage() {
                 ) : (
                     <>
                         <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 space-y-4">
-                            {messages.map(msg => {
+                            {loadingMessages ? (
+                                <div className="flex items-center justify-center h-full">
+                                    <div className="text-center space-y-3">
+                                        <div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto"></div>
+                                        <p className="text-sm text-muted-foreground">Loading messages...</p>
+                                    </div>
+                                </div>
+                            ) : messages.length === 0 ? (
+                                <div className="flex items-center justify-center h-full">
+                                    <p className="text-sm text-muted-foreground">No messages yet. Start the conversation! 👋</p>
+                                </div>
+                            ) : (
+                                messages.map(msg => {
                                 let plainText = "";
                                 try {
                                     const bytes = CryptoJS.AES.decrypt(msg.text, currentChatKeyRef.current);
@@ -374,7 +400,8 @@ export default function ChatPage() {
                                         </div>
                                     </div>
                                 );
-                            })}
+                            })
+                            )}
                         </div>
                         <div className="p-4 border-t border-border bg-background/50">
                             <form onSubmit={sendMessage} className="max-w-4xl mx-auto flex gap-3">

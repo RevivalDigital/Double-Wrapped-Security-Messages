@@ -14,9 +14,10 @@ export function base64ToBuf(base64: string): ArrayBuffer {
 }
 
 export function strToBuf(str: string): ArrayBuffer {
-  return new TextEncoder().encode(str)
+  const uint8 = new TextEncoder().encode(str)
+  return uint8.buffer   // 🔥 FIX DI SINI
 }
 
 export function bufToStr(buf: ArrayBuffer): string {
-  return new TextDecoder().decode(buf)
+  return new TextDecoder().decode(new Uint8Array(buf))
 }

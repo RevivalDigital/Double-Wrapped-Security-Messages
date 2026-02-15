@@ -4,11 +4,11 @@ import { useEffect, useState, useRef } from 'react';
 import PocketBase from 'pocketbase';
 import * as CryptoJS from 'crypto-js';
 
-const PB_URL = process.env.NEXT_PUBLIC_PB_URL || 'https://pb.bitlab.web.id';
+const PB_URL = process.env.NEXT_PUBLIC_PB_URL;
 const pb = new PocketBase(PB_URL);
 
-const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "BITLAB-SEC-";
-const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "2026-PRO";
+const KEY1 = process.env.NEXT_PUBLIC_KEY1;
+const KEY2 = process.env.NEXT_PUBLIC_KEY2;
 const INTERNAL_APP_KEY = KEY1 + KEY2;
 
 export default function ChatPage() {
@@ -142,15 +142,50 @@ export default function ChatPage() {
 
     const addFriend = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!searchId || searchId === myUser.id) return;
+        const input = searchId.trim();
+        if (!input || input === myUser.id || input === myUser.email) {
+            return alert("ID atau Email tidak valid.");
+        }
+
         try {
-            const userList = await pb.collection('users').getList(1, 1, { filter: `id = "${searchId}" || email = "${searchId}"` });
-            if (userList.items.length === 0) return alert("User tidak ditemukan.");
+            // 1. Cari user target
+            const userList = await pb.collection('users').getList(1, 1, { 
+                filter: `id = "${input}" || email = "${input}"` 
+            });
+
+            if (userList.items.length === 0) {
+                return alert("User tidak ditemukan.");
+            }
+
             const target = userList.items[0];
-            await pb.collection('friends').create({ user: myUser.id, friend: target.id, status: 'pending', sender: myUser.id, receiver: target.id });
-            alert("Permintaan terkirim!");
+
+            // 2. Cek apakah sudah ada hubungan (Pending atau Accepted)
+            const existing = await pb.collection('friends').getList(1, 1, {
+                filter: `(user = "${myUser.id}" && friend = "${target.id}") || (user = "${target.id}" && friend = "${myUser.id}")`
+            });
+
+            if (existing.items.length > 0) {
+                const relation = existing.items[0];
+                if (relation.status === 'accepted') {
+                    return alert("Anda sudah berteman dengan user ini.");
+                } else {
+                    return alert("Permintaan pertemanan sudah ada (menunggu konfirmasi).");
+                }
+            }
+
+            // 3. Jika bersih, buat permintaan baru
+            await pb.collection('friends').create({ 
+                user: myUser.id, 
+                friend: target.id, 
+                status: 'pending' 
+            });
+
+            alert("Permintaan pertemanan berhasil dikirim!");
             setSearchId("");
-        } catch (err) { alert("Gagal kirim permintaan."); }
+        } catch (err) { 
+            console.error(err);
+            alert("Gagal mengirim permintaan."); 
+        }
     };
 
     if (!myUser) return <div className="h-screen flex items-center justify-center bg-background text-foreground animate-pulse">Initializing...</div>;

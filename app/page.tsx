@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from "react";
 import PocketBase from "pocketbase";
-import { Bell, Send } from "lucide-react";
 
 const pb = new PocketBase(process.env.NEXT_PUBLIC_PB_URL);
 
@@ -16,17 +15,16 @@ export default function ChatPage() {
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotif, setShowNotif] = useState(false);
 
-  // ===============================
-  // INIT
-  // ===============================
-
+  // ================= INIT =================
   useEffect(() => {
     if (!pb.authStore.isValid) {
       window.location.href = "/login";
       return;
     }
 
-    setMyUser(pb.authStore.model);
+    const user = pb.authStore.model;
+    setMyUser(user);
+
     loadFriends();
     loadNotifications();
 
@@ -34,12 +32,10 @@ export default function ChatPage() {
       Notification.requestPermission();
     }
 
-    // Friends realtime
     pb.collection("friends").subscribe("*", () => {
       loadFriends();
     });
 
-    // Messages realtime
     pb.collection("messages").subscribe("*", async (e) => {
       if (e.action !== "create") return;
 
@@ -47,7 +43,6 @@ export default function ChatPage() {
       const myId = pb.authStore.model?.id;
       if (!myId) return;
 
-      // Kalau pesan untuk saya
       if (msg.receiver === myId && msg.sender !== myId) {
         await pb.collection("notifications").create({
           user: myId,
@@ -65,7 +60,6 @@ export default function ChatPage() {
         }
       }
 
-      // Update chat aktif
       if (
         activeChat &&
         ((msg.sender === myId && msg.receiver === activeChat.id) ||
@@ -75,7 +69,6 @@ export default function ChatPage() {
       }
     });
 
-    // Notifications realtime
     pb.collection("notifications").subscribe("*", (e) => {
       if (e.record.user === pb.authStore.model?.id) {
         loadNotifications();
@@ -89,9 +82,7 @@ export default function ChatPage() {
     };
   }, [activeChat]);
 
-  // ===============================
-  // LOADERS
-  // ===============================
+  // ================= LOADERS =================
 
   const loadFriends = async () => {
     const user = pb.authStore.model;
@@ -130,9 +121,7 @@ export default function ChatPage() {
     setUnreadCount(res.filter((n) => !n.is_read).length);
   };
 
-  // ===============================
-  // SEND MESSAGE
-  // ===============================
+  // ================= SEND =================
 
   const sendMessage = async () => {
     if (!text.trim() || !activeChat) return;
@@ -148,9 +137,7 @@ export default function ChatPage() {
     setText("");
   };
 
-  // ===============================
-  // UI
-  // ===============================
+  // ================= UI =================
 
   return (
     <div className="flex h-screen bg-[#020817] text-white">
@@ -199,11 +186,23 @@ export default function ChatPage() {
             {activeChat ? activeChat.username : "Pilih Chat"}
           </div>
 
-          <div className="relative">
-            <Bell
-              className="w-5 h-5 cursor-pointer"
-              onClick={() => setShowNotif(!showNotif)}
-            />
+          {/* BELL */}
+          <div className="relative cursor-pointer" onClick={() => setShowNotif(!showNotif)}>
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              className="w-5 h-5"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6 6 0 10-12 0v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
+              />
+            </svg>
+
             {unreadCount > 0 && (
               <span className="absolute -top-2 -right-2 bg-red-500 text-xs px-2 rounded-full">
                 {unreadCount}
@@ -284,7 +283,20 @@ export default function ChatPage() {
               onClick={sendMessage}
               className="bg-blue-600 p-2 rounded-full"
             >
-              <Send size={18} />
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                className="w-4 h-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="white"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M5 12h14M12 5l7 7-7 7"
+                />
+              </svg>
             </button>
           </div>
         )}

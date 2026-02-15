@@ -23,9 +23,12 @@ export default function ChatPage() {
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
     const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
     const [loadingMessages, setLoadingMessages] = useState(false);
+    const [loadError, setLoadError] = useState<string | null>(null);
+    const [isLoadingTimeout, setIsLoadingTimeout] = useState(false);
     
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
+    const loadingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
     // --- HELPER ENCRYPTION (TIDAK BERUBAH) ---
     const encryptSalt = (raw: string) => CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
@@ -286,13 +289,28 @@ export default function ChatPage() {
         if (!myUser?.id) return; // Guard clause untuk TypeScript
         
         setLoadingMessages(true);
+        setLoadError(null);
+        setIsLoadingTimeout(false);
+        
+        // Clear previous timeout
+        if (loadingTimeoutRef.current) {
+            clearTimeout(loadingTimeoutRef.current);
+        }
+        
+        // Set timeout warning after 5 seconds
+        loadingTimeoutRef.current = setTimeout(() => {
+            if (loadingMessages) {
+                setIsLoadingTimeout(true);
+                console.warn('⚠️ Loading taking longer than expected...');
+            }
+        }, 5000);
         
         const friendData = friendRecord.user === myUser.id ? friendRecord.expand.friend : friendRecord.expand.user;
         const salt = decryptSalt(friendRecord.chat_salt) || "fallback";
         const key = generateChatKey(myUser.id, friendData.id, salt);
         currentChatKeyRef.current = key;
         
-        setActiveChat({ ...friendData, salt });
+        setActiveChat({ ...friendData, salt, friendRecordId: friendRecord.id });
         
         // Reset unread count untuk friend ini (di memory)
         setUnreadCounts(prev => {
@@ -317,6 +335,8 @@ export default function ChatPage() {
         if (cachedMessages && cachedMessages.length > 0) {
             setMessages(cachedMessages);
             setLoadingMessages(false); // Hide loading karena sudah ada cache
+            setLoadError(null);
+            if (loadingTimeoutRef.current) clearTimeout(loadingTimeoutRef.current);
             console.log('✅ Loaded from cache, syncing with server...');
         }
         
@@ -331,21 +351,39 @@ export default function ChatPage() {
             
             // Update UI dengan data fresh dari server
             setMessages(freshMessages);
+            setLoadError(null);
             
             // Save ke cache untuk next time
             saveMessagesToCache(myUser.id, friendData.id, freshMessages);
             
-        } catch (err) {
+        } catch (err: any) {
             console.error('Error loading messages:', err);
+            const errorMsg = err?.message || 'Failed to load messages';
+            setLoadError(errorMsg);
+            
             // Jika error dan tidak ada cache, set empty
             if (!cachedMessages) {
                 setMessages([]);
             }
         } finally {
             setLoadingMessages(false);
+            setIsLoadingTimeout(false);
+            if (loadingTimeoutRef.current) {
+                clearTimeout(loadingTimeoutRef.current);
+            }
         }
         
         if (window.innerWidth < 768) setIsSidebarOpen(false);
+    };
+
+    // Retry loading messages
+    const retryLoadMessages = () => {
+        if (activeChat?.friendRecordId) {
+            const friendRecord = friends.find(f => f.id === activeChat.friendRecordId);
+            if (friendRecord) {
+                selectChat(friendRecord);
+            }
+        }
     };
 
     const sendMessage = async (e: React.FormEvent) => {
@@ -504,6 +542,18 @@ export default function ChatPage() {
                             </div>
                         )}
                     </div>
+                    {activeChat && (
+                        <button 
+                            onClick={retryLoadMessages}
+                            disabled={loadingMessages}
+                            className="p-2 hover:bg-accent rounded-md transition-colors disabled:opacity-50"
+                            title="Sync messages"
+                        >
+                            <svg className={`w-4 h-4 ${loadingMessages ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                        </button>
+                    )}
                 </header>
 
                 {!activeChat ? (
@@ -518,11 +568,55 @@ export default function ChatPage() {
                                     <div className="text-center space-y-3">
                                         <div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto"></div>
                                         <p className="text-sm text-muted-foreground">Loading messages...</p>
+                                        {isLoadingTimeout && (
+                                            <div className="space-y-2">
+                                                <p className="text-xs text-yellow-500">Taking longer than expected...</p>
+                                                <button 
+                                                    onClick={retryLoadMessages}
+                                                    className="px-4 py-2 bg-secondary text-secondary-foreground rounded-md text-xs font-semibold hover:opacity-90 transition-opacity"
+                                                >
+                                                    Cancel & Retry
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            ) : loadError ? (
+                                <div className="flex items-center justify-center h-full">
+                                    <div className="text-center space-y-3 max-w-md">
+                                        <div className="w-12 h-12 rounded-full bg-destructive/10 flex items-center justify-center mx-auto">
+                                            <svg className="w-6 h-6 text-destructive" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-semibold text-destructive mb-1">Failed to Load Messages</p>
+                                            <p className="text-xs text-muted-foreground">{loadError}</p>
+                                        </div>
+                                        <button 
+                                            onClick={retryLoadMessages}
+                                            className="px-6 py-2 bg-primary text-primary-foreground rounded-md text-sm font-semibold hover:opacity-90 transition-opacity flex items-center gap-2 mx-auto"
+                                        >
+                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                            </svg>
+                                            Retry
+                                        </button>
                                     </div>
                                 </div>
                             ) : messages.length === 0 ? (
                                 <div className="flex items-center justify-center h-full">
-                                    <p className="text-sm text-muted-foreground">No messages yet. Start the conversation! 👋</p>
+                                    <div className="text-center space-y-3">
+                                        <div className="w-16 h-16 rounded-full bg-muted/30 flex items-center justify-center mx-auto">
+                                            <svg className="w-8 h-8 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-semibold">No messages yet</p>
+                                            <p className="text-xs text-muted-foreground mt-1">Start the conversation! 👋</p>
+                                        </div>
+                                    </div>
                                 </div>
                             ) : (
                                 messages.map(msg => {

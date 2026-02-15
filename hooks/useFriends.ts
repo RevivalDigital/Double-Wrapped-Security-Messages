@@ -27,10 +27,18 @@ export function useFriends(userId?: string) {
   };
 
   useEffect(() => {
+    if (!userId) return;
+
     load();
+
     pb.collection("friends").subscribe("*", load);
-    return () =>
-      pb.collection("friends").unsubscribe("*");
+
+    return () => {
+      // 🔥 DO NOT return Promise
+      pb.collection("friends")
+        .unsubscribe("*")
+        .catch(() => {});
+    };
   }, [userId]);
 
   return { friends, requests, reload: load };

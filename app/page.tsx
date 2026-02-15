@@ -344,15 +344,15 @@ export default function ChatPage() {
         });
         
         // Update last_read di database untuk persistensi
-        try {
-            const isUserFirst = friendRecord.user === myUser.id;
-            const updateData = isUserFirst 
-                ? { last_read_user: new Date().toISOString() }
-                : { last_read_friend: new Date().toISOString() };
-            await pb.collection('friends').update(friendRecord.id, updateData);
-        } catch (err) {
-            console.error('Error updating last_read:', err);
-        }
+// UPDATE LAST READ (Saat klik teman)
+    try {
+        const isUserFirst = friendRecord.user === myUser.id;
+        await pb.collection('friends').update(friendRecord.id, {
+            [isUserFirst ? 'last_read_user' : 'last_read_friend']: new Date().toISOString()
+        });
+    } catch (err) {
+        console.error('Error updating last_read:', err);
+    }
         
         // STEP 1: Load dari cache dulu (instant)
         const cachedMessages = loadMessagesFromCache(myUser.id, friendData.id);

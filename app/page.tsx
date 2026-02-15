@@ -7,6 +7,11 @@ import * as CryptoJS from "crypto-js";
 /* ================= CONFIG ================= */
 
 const PB_URL = process.env.NEXT_PUBLIC_PB_URL || "";
+
+if (!PB_URL) {
+  console.error("NEXT_PUBLIC_PB_URL is not defined");
+}
+
 const pb = new PocketBase(PB_URL);
 
 const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "";
@@ -22,10 +27,6 @@ export default function ChatPage() {
   const [activeChat, setActiveChat] = useState<any>(null);
   const [messages, setMessages] = useState<any[]>([]);
   const [inputText, setInputText] = useState("");
-  const [searchId, setSearchId] = useState("");
-  const [showNoti, setShowNoti] = useState(false);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-
   const [unreadMap, setUnreadMap] = useState<{ [key: string]: number }>({});
 
   const chatBoxRef = useRef<HTMLDivElement>(null);
@@ -58,6 +59,8 @@ export default function ChatPage() {
   const loadFriends = async () => {
     try {
       const userId = pb.authStore.model?.id;
+      if (!userId) return;
+
       const records = await pb.collection("friends").getFullList({
         expand: "user,friend",
         filter: `user="${userId}" || friend="${userId}"`,
@@ -71,42 +74,14 @@ export default function ChatPage() {
         )
       );
     } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const respondRequest = async (
-    id: string,
-    action: "accepted" | "reject"
-  ) => {
-    try {
-      if (action === "accepted") {
-        const rawSalt = Math.random()
-          .toString(36)
-          .substring(2, 8)
-          .toUpperCase();
-
-        await pb.collection("friends").update(id, {
-          status: "accepted",
-          chat_salt: encryptSalt(rawSalt),
-        });
-      } else {
-        await pb.collection("friends").delete(id);
-      }
-
-      loadFriends();
-    } catch (err) {
-      console.error(err);
+      console.error("Load friends error:", err);
     }
   };
 
   /* ================= NOTIFICATION ================= */
 
   const setupNotifications = () => {
-    if (
-      typeof window !== "undefined" &&
-      "Notification" in window
-    ) {
+    if (typeof window !== "undefined" && "Notification" in window) {
       Notification.requestPermission();
     }
   };
@@ -119,7 +94,6 @@ export default function ChatPage() {
       body: `Pesan baru dari ${senderName}`,
       icon: "/icon.png",
       tag: "new-message",
-      renotify: true,
     });
   };
 
@@ -147,26 +121,28 @@ export default function ChatPage() {
   useEffect(() => {
     if (!myUser) return;
 
-    pb.collection("messages").subscribe("*", (e) => {
-      if (e.action !== "create") return;
+    const unsubscribe = pb
+      .collection("messages")
+      .subscribe("*", (e) => {
+        if (e.action !== "create") return;
 
-      const msg = e.record;
-      if (msg.receiver !== myUser.id) return;
+        const msg = e.record;
+        if (msg.receiver !== myUser.id) return;
 
-      const senderId = msg.sender;
-      const isActive = activeChat?.id === senderId;
+        const senderId = msg.sender;
+        const isActive = activeChat?.id === senderId;
 
-      if (isActive) {
-        setMessages((prev) => [...prev, msg]);
-      } else {
-        setUnreadMap((prev) => ({
-          ...prev,
-          [senderId]: (prev[senderId] || 0) + 1,
-        }));
+        if (isActive) {
+          setMessages((prev) => [...prev, msg]);
+        } else {
+          setUnreadMap((prev) => ({
+            ...prev,
+            [senderId]: (prev[senderId] || 0) + 1,
+          }));
 
-        triggerLocalNotification("Pesan Baru");
-      }
-    });
+          triggerLocalNotification("Teman");
+        }
+      });
 
     return () => {
       pb.collection("messages").unsubscribe("*");
@@ -176,6 +152,8 @@ export default function ChatPage() {
   /* ================= CHAT ================= */
 
   const selectChat = async (friendRecord: any) => {
+    if (!myUser) return;
+
     const friendData =
       friendRecord.user === myUser.id
         ? friendRecord.expand.friend
@@ -193,7 +171,6 @@ export default function ChatPage() {
     currentChatKeyRef.current = key;
     setActiveChat({ ...friendData, salt });
 
-    // reset unread
     setUnreadMap((prev) => ({
       ...prev,
       [friendData.id]: 0,
@@ -205,27 +182,28 @@ export default function ChatPage() {
     });
 
     setMessages(res);
-
-    if (window.innerWidth < 768)
-      setIsSidebarOpen(false);
   };
 
   const sendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim() || !activeChat) return;
+    if (!inputText.trim() || !activeChat || !myUser) return;
 
-    const encrypted = CryptoJS.AES.encrypt(
-      inputText.trim(),
-      currentChatKeyRef.current
-    ).toString();
+    try {
+      const encrypted = CryptoJS.AES.encrypt(
+        inputText.trim(),
+        currentChatKeyRef.current
+      ).toString();
 
-    await pb.collection("messages").create({
-      sender: myUser.id,
-      receiver: activeChat.id,
-      text: encrypted,
-    });
+      await pb.collection("messages").create({
+        sender: myUser.id,
+        receiver: activeChat.id,
+        text: encrypted,
+      });
 
-    setInputText("");
+      setInputText("");
+    } catch (err) {
+      console.error("Send message error:", err);
+    }
   };
 
   /* ================= AUTO SCROLL ================= */
@@ -237,12 +215,13 @@ export default function ChatPage() {
     }
   }, [messages]);
 
-  if (!myUser)
+  if (!myUser) {
     return (
       <div className="h-screen flex items-center justify-center">
         Initializing...
       </div>
     );
+  }
 
   /* ================= UI ================= */
 
@@ -267,8 +246,7 @@ export default function ChatPage() {
               onClick={() => selectChat(f)}
               className="w-full text-left p-2 border rounded relative"
             >
-              {friendData.name ||
-                friendData.email}
+              {friendData.name || friendData.email}
 
               {unreadMap[friendData.id] > 0 && (
                 <span className="absolute top-1 right-1 bg-red-500 text-white text-xs px-2 rounded-full">
@@ -289,33 +267,26 @@ export default function ChatPage() {
         >
           {messages.map((msg) => {
             let plain = "";
-            try {
-              const bytes =
-                CryptoJS.AES.decrypt(
+
+            if (currentChatKeyRef.current) {
+              try {
+                const bytes = CryptoJS.AES.decrypt(
                   msg.text,
                   currentChatKeyRef.current
                 );
-              plain =
-                bytes.toString(
-                  CryptoJS.enc.Utf8
-                );
-            } catch {}
+                plain = bytes.toString(CryptoJS.enc.Utf8);
+              } catch {}
+            }
 
-            const isMe =
-              msg.sender === myUser.id;
+            const isMe = msg.sender === myUser.id;
 
             return (
               <div
                 key={msg.id}
-                className={`${
-                  isMe
-                    ? "text-right"
-                    : "text-left"
-                }`}
+                className={isMe ? "text-right" : "text-left"}
               >
                 <div className="inline-block px-3 py-2 border rounded">
-                  {plain ||
-                    "🔒 [Decrypt Error]"}
+                  {plain || "🔒 [Encrypted]"}
                 </div>
               </div>
             );
@@ -330,9 +301,7 @@ export default function ChatPage() {
             <input
               value={inputText}
               onChange={(e) =>
-                setInputText(
-                  e.target.value
-                )
+                setInputText(e.target.value)
               }
               className="flex-1 border px-3 py-2 rounded"
               placeholder="Type message..."

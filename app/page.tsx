@@ -11,6 +11,27 @@ const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "BITLAB-SEC-";
 const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "2026-PRO";
 const INTERNAL_APP_KEY = KEY1 + KEY2;
 
+const respondRequest = async (id: string, action: 'accepted' | 'reject') => {
+    try {
+        if (action === 'accepted') {
+            // Generate salt baru untuk enkripsi chat
+            const rawSalt = Math.random().toString(36).substring(2, 8).toUpperCase();
+            await pb.collection('friends').update(id, { 
+                status: "accepted", 
+                chat_salt: encryptSalt(rawSalt) 
+            });
+        } else {
+            // Jika ditolak, hapus record permintaan
+            await pb.collection('friends').delete(id);
+        }
+        // Refresh daftar teman
+        loadFriends();
+    } catch (err) {
+        console.error("Gagal merespon permintaan:", err);
+        alert("Gagal memproses permintaan.");
+    }
+};
+
 export default function ChatPage() {
     const [myUser, setMyUser] = useState<any>(null);
     const [friends, setFriends] = useState<any[]>([]);

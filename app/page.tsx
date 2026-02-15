@@ -11,27 +11,6 @@ const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "BITLAB-SEC-";
 const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "2026-PRO";
 const INTERNAL_APP_KEY = KEY1 + KEY2;
 
-const respondRequest = async (id: string, action: 'accepted' | 'reject') => {
-    try {
-        if (action === 'accepted') {
-            // Generate salt baru untuk enkripsi chat
-            const rawSalt = Math.random().toString(36).substring(2, 8).toUpperCase();
-            await pb.collection('friends').update(id, { 
-                status: "accepted", 
-                chat_salt: encryptSalt(rawSalt) 
-            });
-        } else {
-            // Jika ditolak, hapus record permintaan
-            await pb.collection('friends').delete(id);
-        }
-        // Refresh daftar teman
-        loadFriends();
-    } catch (err) {
-        console.error("Gagal merespon permintaan:", err);
-        alert("Gagal memproses permintaan.");
-    }
-};
-
 export default function ChatPage() {
     const [myUser, setMyUser] = useState<any>(null);
     const [friends, setFriends] = useState<any[]>([]);
@@ -46,12 +25,9 @@ export default function ChatPage() {
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
 
-    const handleLogout = () => {
-        pb.authStore.clear();
-        document.cookie = "pb_auth=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-        window.location.href = "/login";
-    };
-
+    // --- HELPER ENCRYPTION ---
+    const encryptSalt = (raw: string) => CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
+    
     const decryptSalt = (enc: string) => {
         if (!enc) return null;
         try {
@@ -59,13 +35,49 @@ export default function ChatPage() {
         } catch (e) { return null; }
     };
 
-    const encryptSalt = (raw: string) => CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
-
     const generateChatKey = (id1: string, id2: string, salt: string) => {
         const combined = [id1, id2].sort().join("");
         return CryptoJS.SHA256(combined + salt + INTERNAL_APP_KEY).toString();
     };
 
+    // --- LOGIC FUNCTIONS ---
+    const loadFriends = async () => {
+        try {
+            const userId = pb.authStore.model?.id;
+            const records = await pb.collection('friends').getFullList({
+                expand: 'user,friend',
+                filter: `user = "${userId}" || friend = "${userId}"`,
+                sort: '-updated'
+            });
+            setFriends(records.filter(r => r.status === 'accepted'));
+            setRequests(records.filter(r => r.status === 'pending' && r.friend === userId));
+        } catch (err) { console.error(err); }
+    };
+
+    const respondRequest = async (id: string, action: 'accepted' | 'reject') => {
+        try {
+            if (action === 'accepted') {
+                const rawSalt = Math.random().toString(36).substring(2, 8).toUpperCase();
+                await pb.collection('friends').update(id, { 
+                    status: "accepted", 
+                    chat_salt: encryptSalt(rawSalt) 
+                });
+            } else {
+                await pb.collection('friends').delete(id);
+            }
+            loadFriends();
+        } catch (err) {
+            console.error("Error responding to request:", err);
+        }
+    };
+
+    const handleLogout = () => {
+        pb.authStore.clear();
+        document.cookie = "pb_auth=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+        window.location.href = "/login";
+    };
+
+    // --- EFFECTS ---
     useEffect(() => {
         if (!pb.authStore.isValid) {
             window.location.href = "/login";
@@ -74,7 +86,6 @@ export default function ChatPage() {
         setMyUser(pb.authStore.model);
         loadFriends();
         
-        // Mobile auto-hide sidebar if chat is active
         if (window.innerWidth < 768 && activeChat) {
             setIsSidebarOpen(false);
         }
@@ -88,19 +99,6 @@ export default function ChatPage() {
             chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
         }
     }, [messages]);
-
-    const loadFriends = async () => {
-        try {
-            const userId = pb.authStore.model?.id;
-            const records = await pb.collection('friends').getFullList({
-                expand: 'user,friend',
-                filter: `user = "${userId}" || friend = "${userId}"`,
-                sort: '-updated'
-            });
-            setFriends(records.filter(r => r.status === 'accepted'));
-            setRequests(records.filter(r => r.status === 'pending' && r.friend === userId));
-        } catch (err) { console.error(err); }
-    };
 
     const selectChat = async (friendRecord: any) => {
         const friendData = friendRecord.user === myUser.id ? friendRecord.expand.friend : friendRecord.expand.user;
@@ -173,7 +171,7 @@ export default function ChatPage() {
                     </button>
                 </div>
 
-                {/* Notifications Dropdown (Shadcn Popover style) */}
+                {/* Notifications Dropdown */}
                 {showNoti && (
                     <div className="absolute top-14 left-4 right-4 bg-popover border border-border shadow-md rounded-lg z-[60] py-2 animate-in fade-in zoom-in duration-200">
                         <p className="px-4 py-1 text-[10px] font-bold text-muted-foreground uppercase">Requests</p>
@@ -184,6 +182,7 @@ export default function ChatPage() {
                                         <span className="text-xs font-medium truncate">{req.expand.user.name || req.expand.user.email}</span>
                                         <div className="flex gap-1">
                                             <button onClick={() => respondRequest(req.id, 'accepted')} className="px-2 py-1 bg-primary text-primary-foreground text-[10px] rounded hover:opacity-90">Accept</button>
+                                            <button onClick={() => respondRequest(req.id, 'reject')} className="px-2 py-1 bg-destructive text-destructive-foreground text-[10px] rounded hover:opacity-90">Reject</button>
                                         </div>
                                     </div>
                                 ))
@@ -239,7 +238,6 @@ export default function ChatPage() {
 
             {/* Main Chat Area */}
             <main className="flex-1 flex flex-col bg-background relative">
-                {/* Header Mobile Chat */}
                 <header className="h-14 border-b border-border flex items-center px-4 justify-between bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 sticky top-0 z-30">
                     <div className="flex items-center gap-3">
                         <button onClick={() => setIsSidebarOpen(true)} className="md:hidden p-2 -ml-2 hover:bg-accent rounded-md">
@@ -268,7 +266,6 @@ export default function ChatPage() {
                     </div>
                 ) : (
                     <>
-                        {/* Messages Box */}
                         <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4">
                             {messages.map(msg => {
                                 let plainText = "";
@@ -290,7 +287,6 @@ export default function ChatPage() {
                             })}
                         </div>
 
-                        {/* Input Area */}
                         <div className="p-4 border-t border-border bg-background">
                             <form onSubmit={sendMessage} className="max-w-4xl mx-auto flex gap-2">
                                 <input value={inputText} onChange={(e) => setInputText(e.target.value)} placeholder="Type a message..." className="flex-1 h-10 bg-transparent border border-input rounded-md px-4 text-sm outline-none focus:ring-1 focus:ring-ring" />

@@ -1,13 +1,19 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { pb } from "@/lib/pb";
 import CryptoJS from "crypto-js";
+import type { RecordModel } from "pocketbase";
 
-interface Friend {
-  id: string;
+interface FriendRecord extends RecordModel {
+  user: string;
   friend: string;
-  expand?: any;
+  expand?: {
+    friend?: {
+      id: string;
+      username: string;
+    };
+  };
 }
 
 interface Message {
@@ -24,10 +30,20 @@ interface ActiveChat {
   chatKey: string;
 }
 
+function mapRecordToMessage(record: RecordModel): Message {
+  return {
+    id: record.id,
+    sender: record.get("sender"),
+    receiver: record.get("receiver"),
+    text: record.get("text"),
+    created: record.created,
+  };
+}
+
 export default function ChatPage() {
   const myId = pb.authStore.model?.id;
 
-  const [friends, setFriends] = useState<Friend[]>([]);
+  const [friends, setFriends] = useState<FriendRecord[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeChat, setActiveChat] = useState<ActiveChat | null>(null);
   const [newMessage, setNewMessage] = useState("");
@@ -46,38 +62,43 @@ export default function ChatPage() {
         filter: `user="${myId}"`,
         expand: "friend",
       });
-      setFriends(res as any);
+
+      setFriends(res as FriendRecord[]);
     };
 
     loadFriends();
   }, [myId]);
 
   // =========================
-  // REALTIME SUBSCRIBE (GLOBAL)
+  // REALTIME SUBSCRIBE
   // =========================
   useEffect(() => {
     if (!myId) return;
 
-    pb.collection("messages").subscribe(
-      `receiver="${myId}" || sender="${myId}"`,
-      (e) => {
-        if (e.action !== "create") return;
+    const subscribe = async () => {
+      await pb.collection("messages").subscribe(
+        `receiver="${myId}" || sender="${myId}"`,
+        (e) => {
+          if (e.action !== "create") return;
 
-        const msg = e.record as Message;
+          const msg = mapRecordToMessage(e.record);
 
-        setMessages((prev) => {
-          if (!activeChat) return prev;
+          setMessages((prev) => {
+            if (!activeChat) return prev;
 
-          const isRelevant =
-            (msg.sender === myId && msg.receiver === activeChat.id) ||
-            (msg.sender === activeChat.id && msg.receiver === myId);
+            const isRelevant =
+              (msg.sender === myId && msg.receiver === activeChat.id) ||
+              (msg.sender === activeChat.id && msg.receiver === myId);
 
-          if (!isRelevant) return prev;
+            if (!isRelevant) return prev;
 
-          return [...prev, msg];
-        });
-      }
-    );
+            return [...prev, msg];
+          });
+        }
+      );
+    };
+
+    subscribe();
 
     return () => {
       pb.collection("messages").unsubscribe();
@@ -85,7 +106,7 @@ export default function ChatPage() {
   }, [myId, activeChat]);
 
   // =========================
-  // LOAD MESSAGES PER CHAT
+  // LOAD MESSAGES
   // =========================
   const loadMessages = async (friendId: string) => {
     if (!myId) return;
@@ -98,26 +119,27 @@ export default function ChatPage() {
       sort: "created",
     });
 
-    setMessages(res.items as any);
+    const mapped = res.items.map((item) => mapRecordToMessage(item));
+    setMessages(mapped);
+
     setLoadingMessages(false);
   };
 
   // =========================
   // SELECT CHAT
   // =========================
-  const selectChat = async (friend: Friend) => {
+  const selectChat = async (friend: FriendRecord) => {
     const friendId = friend.expand?.friend?.id;
     const username = friend.expand?.friend?.username;
 
-    if (!friendId) return;
+    if (!friendId || !myId) return;
 
-    // Generate deterministic chat key
     const salt = [myId, friendId].sort().join(":");
     const chatKey = CryptoJS.SHA256(salt).toString();
 
     setActiveChat({
       id: friendId,
-      username,
+      username: username || "Unknown",
       chatKey,
     });
 
@@ -125,7 +147,7 @@ export default function ChatPage() {
   };
 
   // =========================
-  // SEND MESSAGE (E2EE)
+  // SEND MESSAGE
   // =========================
   const sendMessage = async () => {
     if (!newMessage.trim() || !activeChat || !myId) return;
@@ -160,19 +182,24 @@ export default function ChatPage() {
       {/* FRIEND LIST */}
       <div className="w-1/4 border-r p-4 overflow-y-auto">
         <h2 className="font-bold mb-4">Friends</h2>
-        {friends.map((f) => (
-          <div
-            key={f.id}
-            onClick={() => selectChat(f)}
-            className={`p-2 cursor-pointer rounded ${
-              activeChat?.id === f.expand?.friend?.id
-                ? "bg-blue-200"
-                : "hover:bg-gray-100"
-            }`}
-          >
-            {f.expand?.friend?.username}
-          </div>
-        ))}
+
+        {friends.map((f) => {
+          const friendId = f.expand?.friend?.id;
+
+          return (
+            <div
+              key={f.id}
+              onClick={() => selectChat(f)}
+              className={`p-2 cursor-pointer rounded ${
+                activeChat?.id === friendId
+                  ? "bg-blue-200"
+                  : "hover:bg-gray-100"
+              }`}
+            >
+              {f.expand?.friend?.username}
+            </div>
+          );
+        })}
       </div>
 
       {/* CHAT AREA */}
@@ -191,11 +218,13 @@ export default function ChatPage() {
             let plainText = "";
 
             try {
-              const bytes = CryptoJS.AES.decrypt(
-                msg.text,
-                activeChat?.chatKey || ""
-              );
-              plainText = bytes.toString(CryptoJS.enc.Utf8);
+              if (activeChat?.chatKey) {
+                const bytes = CryptoJS.AES.decrypt(
+                  msg.text,
+                  activeChat.chatKey
+                );
+                plainText = bytes.toString(CryptoJS.enc.Utf8);
+              }
             } catch {
               plainText = "[Decrypt error]";
             }

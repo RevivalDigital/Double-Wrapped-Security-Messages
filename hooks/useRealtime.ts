@@ -9,7 +9,7 @@ export function useRealtime(
   useEffect(() => {
     if (!myId) return;
 
-    pb.collection("messages").subscribe("*", (e) => {
+    const handleMessage = (e: any) => {
       if (e.action !== "create") return;
 
       const msg = e.record;
@@ -26,9 +26,15 @@ export function useRealtime(
       if (relevant && onMessage) {
         onMessage(msg);
       }
-    });
+    };
 
-    return () =>
-      pb.collection("messages").unsubscribe("*");
-  }, [myId, activeId]);
+    pb.collection("messages").subscribe("*", handleMessage);
+
+    return () => {
+      // 🔥 DO NOT return Promise
+      pb.collection("messages")
+        .unsubscribe("*")
+        .catch(() => {});
+    };
+  }, [myId, activeId, onMessage]);
 }

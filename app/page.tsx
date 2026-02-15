@@ -22,9 +22,13 @@ export default function ChatPage() {
     const [showNoti, setShowNoti] = useState(false);
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
     const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+    const [loadingMessages, setLoadingMessages] = useState(false);
+    const [loadError, setLoadError] = useState<string | null>(null);
+    const [isLoadingTimeout, setIsLoadingTimeout] = useState(false);
     
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
+    const loadingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
     // --- HELPER ENCRYPTION (TIDAK BERUBAH) ---
     const encryptSalt = (raw: string) => CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
@@ -40,6 +44,100 @@ export default function ChatPage() {
     const generateChatKey = (id1: string, id2: string, salt: string) => {
         const combined = [id1, id2].sort().join("");
         return CryptoJS.SHA256(combined + salt + INTERNAL_APP_KEY).toString();
+    };
+
+    // --- LOCAL STORAGE CACHE (ENCRYPTED) ---
+    const encryptCache = (data: any) => {
+        try {
+            const jsonStr = JSON.stringify(data);
+            return CryptoJS.AES.encrypt(jsonStr, INTERNAL_APP_KEY).toString();
+        } catch (e) {
+            console.error('Encrypt cache error:', e);
+            return null;
+        }
+    };
+
+    const decryptCache = (encrypted: string) => {
+        try {
+            const bytes = CryptoJS.AES.decrypt(encrypted, INTERNAL_APP_KEY);
+            const jsonStr = bytes.toString(CryptoJS.enc.Utf8);
+            return jsonStr ? JSON.parse(jsonStr) : null;
+        } catch (e) {
+            console.error('Decrypt cache error:', e);
+            return null;
+        }
+    };
+
+    const getCacheKey = (userId: string, friendId: string) => {
+        return `bitlab_chat_${userId}_${friendId}`;
+    };
+
+    const saveMessagesToCache = (userId: string, friendId: string, messages: any[]) => {
+        try {
+            const cacheKey = getCacheKey(userId, friendId);
+            const cacheData = {
+                messages,
+                timestamp: Date.now(),
+                version: '1.0' // Untuk migration jika format berubah
+            };
+            const encrypted = encryptCache(cacheData);
+            if (encrypted) {
+                localStorage.setItem(cacheKey, encrypted);
+                console.log(`💾 Cached ${messages.length} messages for ${friendId}`);
+            }
+        } catch (e) {
+            console.error('Save cache error:', e);
+        }
+    };
+
+    const loadMessagesFromCache = (userId: string, friendId: string) => {
+        try {
+            const cacheKey = getCacheKey(userId, friendId);
+            const encrypted = localStorage.getItem(cacheKey);
+            
+            if (!encrypted) return null;
+            
+            const cacheData = decryptCache(encrypted);
+            if (!cacheData || !cacheData.messages) return null;
+            
+            // Cache expires after 7 days
+            const age = Date.now() - cacheData.timestamp;
+            const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+            
+            if (age > maxAge) {
+                localStorage.removeItem(cacheKey);
+                console.log('🗑️ Cache expired, removed');
+                return null;
+            }
+            
+            console.log(`📦 Loaded ${cacheData.messages.length} messages from cache`);
+            return cacheData.messages;
+        } catch (e) {
+            console.error('Load cache error:', e);
+            return null;
+        }
+    };
+
+    const clearChatCache = (userId: string, friendId?: string) => {
+        try {
+            if (friendId) {
+                // Clear specific chat
+                const cacheKey = getCacheKey(userId, friendId);
+                localStorage.removeItem(cacheKey);
+                console.log(`🗑️ Cleared cache for ${friendId}`);
+            } else {
+                // Clear all chats for user
+                const prefix = `bitlab_chat_${userId}_`;
+                Object.keys(localStorage).forEach(key => {
+                    if (key.startsWith(prefix)) {
+                        localStorage.removeItem(key);
+                    }
+                });
+                console.log('🗑️ Cleared all chat cache');
+            }
+        } catch (e) {
+            console.error('Clear cache error:', e);
+        }
     };
 
     // --- LOGIC FUNCTIONS ---
@@ -138,13 +236,43 @@ export default function ChatPage() {
             if (e.action === 'create') {
                 const msg = e.record;
                 const myId = pb.authStore.model?.id;
+                if (!myId) return; // Guard clause
+                
+                console.log('📨 New message received:', {
+                    from: msg.sender,
+                    to: msg.receiver,
+                    myId,
+                    activeChat: activeChat?.id
+                });
+                
                 const isForMe = msg.receiver === myId;
                 const isFromMe = msg.sender === myId;
                 const isFromActive = activeChat && msg.sender === activeChat.id;
+                const isToActive = activeChat && msg.receiver === activeChat.id;
 
-                // Sync UI jika chat sedang dibuka
-                if (isFromActive || isFromMe) {
-                    setMessages(prev => [...prev, msg]);
+                // Sync UI jika chat sedang dibuka DAN pesan memang untuk chat ini
+                // Pesan harus antara myId dan activeChat.id
+                const isRelevantToActiveChat = activeChat && (
+                    (msg.sender === myId && msg.receiver === activeChat.id) ||        // Saya kirim ke active
+                    (msg.sender === activeChat.id && msg.receiver === myId)           // Active kirim ke saya
+                );
+
+                console.log('🔍 Message relevance:', {
+                    isRelevantToActiveChat,
+                    willAddToUI: isRelevantToActiveChat
+                });
+
+                if (isRelevantToActiveChat) {
+                    setMessages(prev => {
+                        const updated = [...prev, msg];
+                        
+                        // Update cache dengan pesan baru
+                        if (activeChat && myId) {
+                            saveMessagesToCache(myId, activeChat.id, updated);
+                        }
+                        
+                        return updated;
+                    });
                 }
 
                 // Notifikasi jika tab sedang di-minimize atau sedang buka chat orang lain
@@ -177,12 +305,36 @@ export default function ChatPage() {
     }, [messages]);
 
     const selectChat = async (friendRecord: any) => {
+        if (!myUser?.id) return; // Guard clause untuk TypeScript
+        
+        // Clear messages immediately saat ganti chat
+        setMessages([]);
+        setLoadingMessages(true);
+        setLoadError(null);
+        setIsLoadingTimeout(false);
+        
+        // Clear previous timeout
+        if (loadingTimeoutRef.current) {
+            clearTimeout(loadingTimeoutRef.current);
+        }
+        
+        // Set timeout warning after 5 seconds
+        loadingTimeoutRef.current = setTimeout(() => {
+            if (loadingMessages) {
+                setIsLoadingTimeout(true);
+                console.warn('⚠️ Loading taking longer than expected...');
+            }
+        }, 5000);
+        
         const friendData = friendRecord.user === myUser.id ? friendRecord.expand.friend : friendRecord.expand.user;
         const salt = decryptSalt(friendRecord.chat_salt) || "fallback";
         const key = generateChatKey(myUser.id, friendData.id, salt);
         currentChatKeyRef.current = key;
         
-        setActiveChat({ ...friendData, salt });
+        // Set activeChat SEBELUM load messages (penting untuk real-time filter)
+        setActiveChat({ ...friendData, salt, friendRecordId: friendRecord.id });
+        
+        console.log('🔄 Switching to chat with:', friendData.id, friendData.name || friendData.email);
         
         // Reset unread count untuk friend ini (di memory)
         setUnreadCounts(prev => {
@@ -202,12 +354,79 @@ export default function ChatPage() {
             console.error('Error updating last_read:', err);
         }
         
-        const res = await pb.collection('messages').getFullList({
-            filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
-            sort: 'created'
-        });
-        setMessages(res);
+        // STEP 1: Load dari cache dulu (instant)
+        const cachedMessages = loadMessagesFromCache(myUser.id, friendData.id);
+        if (cachedMessages && cachedMessages.length > 0) {
+            setMessages(cachedMessages);
+            setLoadingMessages(false); // Hide loading karena sudah ada cache
+            setLoadError(null);
+            if (loadingTimeoutRef.current) clearTimeout(loadingTimeoutRef.current);
+            console.log('✅ Loaded from cache, syncing with server...');
+        }
+        
+        // STEP 2: Sync dengan server di background
+        try {
+            const res = await pb.collection('messages').getList(1, 50, {
+                filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
+                sort: '-created', // Descending (terbaru dulu)
+                $autoCancel: false // Allow multiple requests (no auto-cancel)
+            });
+            
+            const freshMessages = res.items.reverse();
+            
+            // Update UI dengan data fresh dari server
+            setMessages(freshMessages);
+            setLoadError(null);
+            
+            // Save ke cache untuk next time
+            saveMessagesToCache(myUser.id, friendData.id, freshMessages);
+            
+        } catch (err: any) {
+            console.error('Error loading messages:', err);
+            
+            // Ignore auto-cancel errors (happens when user switches chat quickly)
+            const isAutoCancel = 
+                err?.isAbort || 
+                err?.name === 'AbortError' ||
+                err?.message?.includes('autocancelled') ||
+                err?.message?.includes('aborted');
+            
+            if (isAutoCancel) {
+                console.log('⏭️ Request cancelled (user switched chat or duplicate request)');
+                // Don't show error, just keep cache if available
+                if (!cachedMessages) {
+                    setLoadingMessages(false);
+                }
+                return;
+            }
+            
+            // Real errors - show error state
+            const errorMsg = err?.message || 'Failed to load messages';
+            setLoadError(errorMsg);
+            
+            // Jika error dan tidak ada cache, set empty
+            if (!cachedMessages) {
+                setMessages([]);
+            }
+        } finally {
+            setLoadingMessages(false);
+            setIsLoadingTimeout(false);
+            if (loadingTimeoutRef.current) {
+                clearTimeout(loadingTimeoutRef.current);
+            }
+        }
+        
         if (window.innerWidth < 768) setIsSidebarOpen(false);
+    };
+
+    // Retry loading messages
+    const retryLoadMessages = () => {
+        if (activeChat?.friendRecordId) {
+            const friendRecord = friends.find(f => f.id === activeChat.friendRecordId);
+            if (friendRecord) {
+                selectChat(friendRecord);
+            }
+        }
     };
 
     const sendMessage = async (e: React.FormEvent) => {
@@ -245,7 +464,7 @@ export default function ChatPage() {
                     <button onClick={() => setShowNoti(!showNoti)} className="relative p-2 hover:bg-accent rounded-md">
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>
                         {(requests.length > 0 || getTotalUnread() > 0) && (
-                            <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] bg-primary text-primary-foreground rounded-full flex items-center justify-center text-[9px] font-bold px-1">
+                            <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[10px] font-bold px-1 shadow-lg animate-pulse">
                                 {requests.length + getTotalUnread()}
                             </span>
                         )}
@@ -287,7 +506,7 @@ export default function ChatPage() {
                                 <div className="relative">
                                     <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">{(friendData?.name || 'U')[0].toUpperCase()}</div>
                                     {unreadCount > 0 && (
-                                        <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] bg-primary text-primary-foreground rounded-full flex items-center justify-center text-[8px] font-bold px-1">
+                                        <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] font-bold px-1 shadow-lg border-2 border-card">
                                             {unreadCount}
                                         </span>
                                     )}
@@ -295,7 +514,7 @@ export default function ChatPage() {
                                 <div className="text-left truncate flex-1">
                                     <div className="text-sm font-semibold truncate">{friendData?.name || friendData?.username || friendData?.email}</div>
                                     {unreadCount > 0 ? (
-                                        <p className="text-[10px] text-primary font-bold">{unreadCount} pesan baru</p>
+                                        <p className="text-[10px] text-red-500 font-bold">{unreadCount} pesan baru</p>
                                     ) : (
                                         <p className="text-[10px] text-emerald-500 font-bold flex items-center gap-1"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" /> Secured Session</p>
                                     )}
@@ -306,7 +525,7 @@ export default function ChatPage() {
                 </div>
                 
                 {/* INFO AKUN DI SIDEBAR BAWAH (DIPERTAHANKAN) */}
-                <div className="p-4 border-t border-border bg-muted/20">
+                <div className="p-4 border-t border-border bg-muted/20 space-y-2">
                     <button 
                         onClick={() => window.location.href = "/profile"} 
                         className="w-full flex items-center gap-3 p-2 rounded-md hover:bg-accent transition-colors group"
@@ -330,6 +549,22 @@ export default function ChatPage() {
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
                         </svg>
                     </button>
+                    
+                    {/* Clear Cache Button */}
+                    <button 
+                        onClick={() => {
+                            if (confirm('Clear all cached messages? This will free up storage but messages will need to reload from server.')) {
+                                clearChatCache(myUser.id);
+                                alert('✅ Cache cleared successfully!');
+                            }
+                        }}
+                        className="w-full flex items-center gap-2 p-2 rounded-md hover:bg-accent/50 transition-colors text-xs text-muted-foreground hover:text-foreground"
+                    >
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                        <span>Clear Cache</span>
+                    </button>
                 </div>
             </aside>
 
@@ -350,6 +585,18 @@ export default function ChatPage() {
                             </div>
                         )}
                     </div>
+                    {activeChat && (
+                        <button 
+                            onClick={retryLoadMessages}
+                            disabled={loadingMessages}
+                            className="p-2 hover:bg-accent rounded-md transition-colors disabled:opacity-50"
+                            title="Sync messages"
+                        >
+                            <svg className={`w-4 h-4 ${loadingMessages ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                        </button>
+                    )}
                 </header>
 
                 {!activeChat ? (
@@ -359,7 +606,63 @@ export default function ChatPage() {
                 ) : (
                     <>
                         <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 space-y-4">
-                            {messages.map(msg => {
+                            {loadingMessages ? (
+                                <div className="flex items-center justify-center h-full">
+                                    <div className="text-center space-y-3">
+                                        <div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto"></div>
+                                        <p className="text-sm text-muted-foreground">Loading messages...</p>
+                                        {isLoadingTimeout && (
+                                            <div className="space-y-2">
+                                                <p className="text-xs text-yellow-500">Taking longer than expected...</p>
+                                                <button 
+                                                    onClick={retryLoadMessages}
+                                                    className="px-4 py-2 bg-secondary text-secondary-foreground rounded-md text-xs font-semibold hover:opacity-90 transition-opacity"
+                                                >
+                                                    Cancel & Retry
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            ) : loadError ? (
+                                <div className="flex items-center justify-center h-full">
+                                    <div className="text-center space-y-3 max-w-md">
+                                        <div className="w-12 h-12 rounded-full bg-destructive/10 flex items-center justify-center mx-auto">
+                                            <svg className="w-6 h-6 text-destructive" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-semibold text-destructive mb-1">Failed to Load Messages</p>
+                                            <p className="text-xs text-muted-foreground">{loadError}</p>
+                                        </div>
+                                        <button 
+                                            onClick={retryLoadMessages}
+                                            className="px-6 py-2 bg-primary text-primary-foreground rounded-md text-sm font-semibold hover:opacity-90 transition-opacity flex items-center gap-2 mx-auto"
+                                        >
+                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                            </svg>
+                                            Retry
+                                        </button>
+                                    </div>
+                                </div>
+                            ) : messages.length === 0 ? (
+                                <div className="flex items-center justify-center h-full">
+                                    <div className="text-center space-y-3">
+                                        <div className="w-16 h-16 rounded-full bg-muted/30 flex items-center justify-center mx-auto">
+                                            <svg className="w-8 h-8 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-semibold">No messages yet</p>
+                                            <p className="text-xs text-muted-foreground mt-1">Start the conversation! 👋</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            ) : (
+                                messages.map(msg => {
                                 let plainText = "";
                                 try {
                                     const bytes = CryptoJS.AES.decrypt(msg.text, currentChatKeyRef.current);
@@ -374,7 +677,8 @@ export default function ChatPage() {
                                         </div>
                                     </div>
                                 );
-                            })}
+                            })
+                            )}
                         </div>
                         <div className="p-4 border-t border-border bg-background/50">
                             <form onSubmit={sendMessage} className="max-w-4xl mx-auto flex gap-3">

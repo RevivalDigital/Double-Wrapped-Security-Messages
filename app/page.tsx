@@ -43,6 +43,100 @@ export default function ChatPage() {
         return CryptoJS.SHA256(combined + salt + INTERNAL_APP_KEY).toString();
     };
 
+    // --- LOCAL STORAGE CACHE (ENCRYPTED) ---
+    const encryptCache = (data: any) => {
+        try {
+            const jsonStr = JSON.stringify(data);
+            return CryptoJS.AES.encrypt(jsonStr, INTERNAL_APP_KEY).toString();
+        } catch (e) {
+            console.error('Encrypt cache error:', e);
+            return null;
+        }
+    };
+
+    const decryptCache = (encrypted: string) => {
+        try {
+            const bytes = CryptoJS.AES.decrypt(encrypted, INTERNAL_APP_KEY);
+            const jsonStr = bytes.toString(CryptoJS.enc.Utf8);
+            return jsonStr ? JSON.parse(jsonStr) : null;
+        } catch (e) {
+            console.error('Decrypt cache error:', e);
+            return null;
+        }
+    };
+
+    const getCacheKey = (userId: string, friendId: string) => {
+        return `bitlab_chat_${userId}_${friendId}`;
+    };
+
+    const saveMessagesToCache = (userId: string, friendId: string, messages: any[]) => {
+        try {
+            const cacheKey = getCacheKey(userId, friendId);
+            const cacheData = {
+                messages,
+                timestamp: Date.now(),
+                version: '1.0' // Untuk migration jika format berubah
+            };
+            const encrypted = encryptCache(cacheData);
+            if (encrypted) {
+                localStorage.setItem(cacheKey, encrypted);
+                console.log(`💾 Cached ${messages.length} messages for ${friendId}`);
+            }
+        } catch (e) {
+            console.error('Save cache error:', e);
+        }
+    };
+
+    const loadMessagesFromCache = (userId: string, friendId: string) => {
+        try {
+            const cacheKey = getCacheKey(userId, friendId);
+            const encrypted = localStorage.getItem(cacheKey);
+            
+            if (!encrypted) return null;
+            
+            const cacheData = decryptCache(encrypted);
+            if (!cacheData || !cacheData.messages) return null;
+            
+            // Cache expires after 7 days
+            const age = Date.now() - cacheData.timestamp;
+            const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+            
+            if (age > maxAge) {
+                localStorage.removeItem(cacheKey);
+                console.log('🗑️ Cache expired, removed');
+                return null;
+            }
+            
+            console.log(`📦 Loaded ${cacheData.messages.length} messages from cache`);
+            return cacheData.messages;
+        } catch (e) {
+            console.error('Load cache error:', e);
+            return null;
+        }
+    };
+
+    const clearChatCache = (userId: string, friendId?: string) => {
+        try {
+            if (friendId) {
+                // Clear specific chat
+                const cacheKey = getCacheKey(userId, friendId);
+                localStorage.removeItem(cacheKey);
+                console.log(`🗑️ Cleared cache for ${friendId}`);
+            } else {
+                // Clear all chats for user
+                const prefix = `bitlab_chat_${userId}_`;
+                Object.keys(localStorage).forEach(key => {
+                    if (key.startsWith(prefix)) {
+                        localStorage.removeItem(key);
+                    }
+                });
+                console.log('🗑️ Cleared all chat cache');
+            }
+        } catch (e) {
+            console.error('Clear cache error:', e);
+        }
+    };
+
     // --- LOGIC FUNCTIONS ---
     const loadFriends = async () => {
         try {
@@ -145,7 +239,16 @@ export default function ChatPage() {
 
                 // Sync UI jika chat sedang dibuka
                 if (isFromActive || isFromMe) {
-                    setMessages(prev => [...prev, msg]);
+                    setMessages(prev => {
+                        const updated = [...prev, msg];
+                        
+                        // Update cache dengan pesan baru
+                        if (activeChat) {
+                            saveMessagesToCache(myId, activeChat.id, updated);
+                        }
+                        
+                        return updated;
+                    });
                 }
 
                 // Notifikasi jika tab sedang di-minimize atau sedang buka chat orang lain
@@ -205,18 +308,35 @@ export default function ChatPage() {
             console.error('Error updating last_read:', err);
         }
         
+        // STEP 1: Load dari cache dulu (instant)
+        const cachedMessages = loadMessagesFromCache(myUser.id, friendData.id);
+        if (cachedMessages && cachedMessages.length > 0) {
+            setMessages(cachedMessages);
+            setLoadingMessages(false); // Hide loading karena sudah ada cache
+            console.log('✅ Loaded from cache, syncing with server...');
+        }
+        
+        // STEP 2: Sync dengan server di background
         try {
-            // Load 50 pesan terbaru untuk performa lebih baik
             const res = await pb.collection('messages').getList(1, 50, {
                 filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
                 sort: '-created' // Descending (terbaru dulu)
             });
             
-            // Reverse agar pesan lama di atas, baru di bawah
-            setMessages(res.items.reverse());
+            const freshMessages = res.items.reverse();
+            
+            // Update UI dengan data fresh dari server
+            setMessages(freshMessages);
+            
+            // Save ke cache untuk next time
+            saveMessagesToCache(myUser.id, friendData.id, freshMessages);
+            
         } catch (err) {
             console.error('Error loading messages:', err);
-            setMessages([]);
+            // Jika error dan tidak ada cache, set empty
+            if (!cachedMessages) {
+                setMessages([]);
+            }
         } finally {
             setLoadingMessages(false);
         }
@@ -320,7 +440,7 @@ export default function ChatPage() {
                 </div>
                 
                 {/* INFO AKUN DI SIDEBAR BAWAH (DIPERTAHANKAN) */}
-                <div className="p-4 border-t border-border bg-muted/20">
+                <div className="p-4 border-t border-border bg-muted/20 space-y-2">
                     <button 
                         onClick={() => window.location.href = "/profile"} 
                         className="w-full flex items-center gap-3 p-2 rounded-md hover:bg-accent transition-colors group"
@@ -343,6 +463,22 @@ export default function ChatPage() {
                         <svg className="w-4 h-4 text-muted-foreground group-hover:text-foreground transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
                         </svg>
+                    </button>
+                    
+                    {/* Clear Cache Button */}
+                    <button 
+                        onClick={() => {
+                            if (confirm('Clear all cached messages? This will free up storage but messages will need to reload from server.')) {
+                                clearChatCache(myUser.id);
+                                alert('✅ Cache cleared successfully!');
+                            }
+                        }}
+                        className="w-full flex items-center gap-2 p-2 rounded-md hover:bg-accent/50 transition-colors text-xs text-muted-foreground hover:text-foreground"
+                    >
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                        <span>Clear Cache</span>
                     </button>
                 </div>
             </aside>

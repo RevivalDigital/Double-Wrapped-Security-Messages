@@ -37,9 +37,7 @@ export default function ChatPage() {
 
   const generateChatKey = (id1: string, id2: string, salt: string) => {
     const combined = [id1, id2].sort().join("");
-    return CryptoJS.SHA256(
-      combined + salt + INTERNAL_APP_KEY
-    ).toString();
+    return CryptoJS.SHA256(combined + salt + INTERNAL_APP_KEY).toString();
   };
 
   // ================= LOAD FRIENDS =================
@@ -89,7 +87,7 @@ export default function ChatPage() {
     setUnreadCounts(counts);
   };
 
-  // ================= REALTIME =================
+  // ================= INIT + REALTIME =================
 
   useEffect(() => {
     if (!pb.authStore.isValid) {
@@ -100,8 +98,15 @@ export default function ChatPage() {
     setMyUser(pb.authStore.model);
     loadFriends();
 
+    // 🔔 Request browser permission
+    if ("Notification" in window) {
+      Notification.requestPermission();
+    }
+
+    // Subscribe friends realtime
     pb.collection("friends").subscribe("*", loadFriends);
 
+    // Subscribe messages realtime (ONLY ONCE)
     pb.collection("messages").subscribe("*", async (e) => {
       if (e.action !== "create") return;
 
@@ -109,14 +114,37 @@ export default function ChatPage() {
       const myId = pb.authStore.model?.id;
       if (!myId) return;
 
+      // Tambah ke chat aktif
       if (
         activeChat &&
-        ((msg.sender === myId &&
-          msg.receiver === activeChat.id) ||
-          (msg.sender === activeChat.id &&
-            msg.receiver === myId))
+        ((msg.sender === myId && msg.receiver === activeChat.id) ||
+          (msg.sender === activeChat.id && msg.receiver === myId))
       ) {
         setMessages((prev) => [...prev, msg]);
+
+        // Auto update last_read jika chat sedang dibuka
+        const friendRecord = friends.find(
+          (f) =>
+            (f.user === myId && f.friend === activeChat.id) ||
+            (f.friend === myId && f.user === activeChat.id)
+        );
+
+        if (friendRecord) {
+          const isUserFirst = friendRecord.user === myId;
+          await pb.collection("friends").update(friendRecord.id, {
+            [isUserFirst ? "last_read_user" : "last_read_friend"]:
+              new Date().toISOString(),
+          });
+        }
+      }
+
+      // 🔔 Browser notification jika tab tidak aktif
+      if (msg.receiver === myId && document.hidden) {
+        if (Notification.permission === "granted") {
+          new Notification("Pesan Baru", {
+            body: "Kamu menerima pesan baru",
+          });
+        }
       }
 
       loadFriends();
@@ -126,12 +154,13 @@ export default function ChatPage() {
       pb.collection("friends").unsubscribe();
       pb.collection("messages").unsubscribe();
     };
-  }, [activeChat]);
+  }, []);
 
+  // Auto scroll
   useEffect(() => {
-    if (chatBoxRef.current)
-      chatBoxRef.current.scrollTop =
-        chatBoxRef.current.scrollHeight;
+    if (chatBoxRef.current) {
+      chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+    }
   }, [messages]);
 
   // ================= SELECT CHAT =================
@@ -147,16 +176,11 @@ export default function ChatPage() {
         ? friendRecord.expand?.friend
         : friendRecord.expand?.user;
 
-    const salt =
-      decryptSalt(friendRecord.chat_salt) || "fallback";
+    const salt = decryptSalt(friendRecord.chat_salt) || "fallback";
 
-    const key = generateChatKey(
-      myUser.id,
-      friendData.id,
-      salt
-    );
-
+    const key = generateChatKey(myUser.id, friendData.id, salt);
     currentChatKeyRef.current = key;
+
     setActiveChat(friendData);
 
     const res = await pb.collection("messages").getFullList({
@@ -196,20 +220,19 @@ export default function ChatPage() {
     setInputText("");
   };
 
-  if (!myUser)
+  if (!myUser) {
     return (
       <div className="h-screen flex items-center justify-center">
         Initializing...
       </div>
     );
+  }
 
   return (
     <div className="flex h-screen bg-background text-foreground">
       {/* SIDEBAR */}
       <aside className="w-80 border-r border-border flex flex-col">
-        <div className="p-4 font-bold">
-          Bitlab Chat
-        </div>
+        <div className="p-4 font-bold">Bitlab Chat</div>
 
         <div className="flex-1 overflow-y-auto px-2">
           {friends.map((f) => {
@@ -218,8 +241,7 @@ export default function ChatPage() {
                 ? f.expand?.friend
                 : f.expand?.user;
 
-            const unread =
-              unreadCounts[friendData?.id] || 0;
+            const unread = unreadCounts[friendData?.id] || 0;
 
             return (
               <button
@@ -243,30 +265,14 @@ export default function ChatPage() {
           })}
         </div>
 
-        {/* PROFILE LINK */}
+        {/* PROFILE */}
         <div className="p-4 border-t border-border">
           <a
             href="/profile"
             className="flex items-center gap-3 hover:bg-accent p-2 rounded"
           >
-            {myUser.avatar ? (
-              <img
-                src={`${PB_URL}/api/files/_pb_users_auth_/${myUser.id}/${myUser.avatar}`}
-                className="w-8 h-8 rounded-full"
-              />
-            ) : (
-              <div className="w-8 h-8 bg-primary text-white rounded-full flex items-center justify-center text-xs">
-                {(myUser.name || "U")[0]}
-              </div>
-            )}
-
-            <div>
-              <div className="font-semibold">
-                {myUser.name || myUser.username}
-              </div>
-              <div className="text-xs opacity-60">
-                View / Edit Profile
-              </div>
+            <div className="font-semibold">
+              {myUser.name || myUser.username}
             </div>
           </a>
         </div>
@@ -292,30 +298,24 @@ export default function ChatPage() {
                 currentChatKeyRef.current
               );
               plain =
-                bytes.toString(CryptoJS.enc.Utf8) ||
-                "🔒 Error";
+                bytes.toString(CryptoJS.enc.Utf8) || "🔒 Error";
             } catch {
               plain = "🔒 Error";
             }
 
-            const isMe =
-              msg.sender === myUser.id;
+            const isMe = msg.sender === myUser.id;
 
             return (
               <div
                 key={msg.id}
                 className={`flex ${
-                  isMe
-                    ? "justify-end"
-                    : "justify-start"
+                  isMe ? "justify-end" : "justify-start"
                 }`}
               >
                 <div className="px-4 py-2 rounded-xl bg-card border">
                   <p>{plain}</p>
                   <span className="text-xs opacity-50">
-                    {new Date(
-                      msg.created
-                    ).toLocaleTimeString([], {
+                    {new Date(msg.created).toLocaleTimeString([], {
                       hour: "2-digit",
                       minute: "2-digit",
                     })}
@@ -333,9 +333,7 @@ export default function ChatPage() {
           >
             <input
               value={inputText}
-              onChange={(e) =>
-                setInputText(e.target.value)
-              }
+              onChange={(e) => setInputText(e.target.value)}
               className="flex-1 border rounded px-4 py-2"
               placeholder="Type message..."
             />

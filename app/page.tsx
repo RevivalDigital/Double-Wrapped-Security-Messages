@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from 'react';
 import PocketBase from 'pocketbase';
-import CryptoJS from 'crypto-js';
+import * as CryptoJS from 'crypto-js';
 
 const PB_URL = process.env.NEXT_PUBLIC_PB_URL || 'https://pb.bitlab.web.id';
 const pb = new PocketBase(PB_URL);
@@ -20,14 +20,13 @@ export default function ChatPage() {
     const [inputText, setInputText] = useState("");
     const [searchId, setSearchId] = useState("");
     const [showNoti, setShowNoti] = useState(false);
+    const [isSidebarOpen, setIsSidebarOpen] = useState(true);
     
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
 
-    // --- LOGOUT FUNCTION ---
     const handleLogout = () => {
         pb.authStore.clear();
-        // Hapus cookie agar middleware me-redirect ke /login
         document.cookie = "pb_auth=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
         window.location.href = "/login";
     };
@@ -53,10 +52,15 @@ export default function ChatPage() {
         }
         setMyUser(pb.authStore.model);
         loadFriends();
+        
+        // Mobile auto-hide sidebar if chat is active
+        if (window.innerWidth < 768 && activeChat) {
+            setIsSidebarOpen(false);
+        }
 
         pb.collection('friends').subscribe('*', () => loadFriends());
         return () => { pb.collection('friends').unsubscribe(); };
-    }, []);
+    }, [activeChat]);
 
     useEffect(() => {
         if (chatBoxRef.current) {
@@ -72,7 +76,6 @@ export default function ChatPage() {
                 filter: `user = "${userId}" || friend = "${userId}"`,
                 sort: '-updated'
             });
-
             setFriends(records.filter(r => r.status === 'accepted'));
             setRequests(records.filter(r => r.status === 'pending' && r.friend === userId));
         } catch (err) { console.error(err); }
@@ -81,13 +84,12 @@ export default function ChatPage() {
     const selectChat = async (friendRecord: any) => {
         const friendData = friendRecord.user === myUser.id ? friendRecord.expand.friend : friendRecord.expand.user;
         const salt = decryptSalt(friendRecord.chat_salt) || friendRecord.chat_salt;
-        
         const key = generateChatKey(myUser.id, friendData.id, salt);
         currentChatKeyRef.current = key;
-        
         setActiveChat({ ...friendData, salt });
         loadMessages(friendData.id);
         subscribeMessages(friendData.id);
+        if (window.innerWidth < 768) setIsSidebarOpen(false);
     };
 
     const loadMessages = async (friendId: string) => {
@@ -112,12 +114,9 @@ export default function ChatPage() {
     const sendMessage = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!inputText.trim() || !activeChat) return;
-
         const encrypted = CryptoJS.AES.encrypt(inputText.trim(), currentChatKeyRef.current).toString();
         await pb.collection('messages').create({
-            sender: myUser.id,
-            receiver: activeChat.id,
-            text: encrypted
+            sender: myUser.id, receiver: activeChat.id, text: encrypted
         });
         setInputText("");
     };
@@ -126,185 +125,157 @@ export default function ChatPage() {
         e.preventDefault();
         if (!searchId || searchId === myUser.id) return;
         try {
-            const userList = await pb.collection('users').getList(1, 1, { 
-                filter: `id = "${searchId}" || email = "${searchId}"` 
-            });
+            const userList = await pb.collection('users').getList(1, 1, { filter: `id = "${searchId}" || email = "${searchId}"` });
             if (userList.items.length === 0) return alert("User tidak ditemukan.");
             const target = userList.items[0];
-            
-            await pb.collection('friends').create({
-                user: myUser.id, friend: target.id, status: 'pending', sender: myUser.id, receiver: target.id
-            });
+            await pb.collection('friends').create({ user: myUser.id, friend: target.id, status: 'pending', sender: myUser.id, receiver: target.id });
             alert("Permintaan terkirim!");
             setSearchId("");
         } catch (err) { alert("Gagal kirim permintaan."); }
     };
 
-    const respondRequest = async (id: string, action: 'accepted' | 'reject') => {
-        if (action === 'accepted') {
-            const rawSalt = Math.random().toString(36).substring(2, 8).toUpperCase();
-            await pb.collection('friends').update(id, { 
-                status: "accepted", 
-                chat_salt: encryptSalt(rawSalt) 
-            });
-        } else {
-            await pb.collection('friends').delete(id);
-        }
-        loadFriends();
-    };
-
-    if (!myUser) return <div className="bg-slate-950 h-screen flex items-center justify-center text-blue-400 font-bold">LOADING SECURE ENGINE...</div>;
+    if (!myUser) return <div className="h-screen flex items-center justify-center bg-background text-foreground animate-pulse">Initializing...</div>;
 
     return (
-        <div className="bg-slate-950 text-slate-100 h-screen overflow-hidden font-sans flex">
-            {/* Notification Dropdown */}
-            <div className="absolute top-4 right-6 z-[100] flex flex-col items-end gap-2">
-                <button onClick={() => setShowNoti(!showNoti)} className="relative p-2.5 bg-slate-900 border border-slate-800 rounded-2xl hover:bg-slate-800 transition-all shadow-2xl group">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="1.5" stroke="currentColor" className="w-6 h-6 text-slate-400 group-hover:text-blue-400">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M14.857 17.082a23.848 23.848 0 0 0 5.454-1.31a8.967 8.967 0 0 1-2.312-6.022c0-4.741-3.844-8.584-8.584-8.584s-8.584 3.844-8.584 8.584c0 2.208-.795 4.316-2.312 6.022a23.847 23.847 0 0 0 5.454 1.31m5.714 0a24.255 24.255 0 0 1-5.714 0m5.714 0a3 3 0 1 1-5.714 0" />
-                    </svg>
-                    {requests.length > 0 && <span className="absolute top-2 right-2.5 w-3 h-3 bg-red-500 rounded-full border-2 border-slate-900 animate-pulse"></span>}
-                </button>
+        <div className="flex h-screen bg-background text-foreground overflow-hidden font-sans border-t border-border">
+            {/* Sidebar Overlay for Mobile */}
+            <div className={`fixed inset-0 bg-background/80 backdrop-blur-sm z-40 md:hidden transition-opacity ${isSidebarOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsSidebarOpen(false)} />
 
+            {/* Sidebar */}
+            <aside className={`fixed md:relative inset-y-0 left-0 w-[280px] md:w-80 bg-card border-r border-border flex flex-col z-50 transition-transform duration-300 transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
+                {/* Header Sidebar */}
+                <div className="p-4 border-b border-border flex items-center justify-between">
+                    <h1 className="text-sm font-semibold tracking-tight uppercase">Bitlab Chat</h1>
+                    <button onClick={() => setShowNoti(!showNoti)} className="relative p-2 hover:bg-accent rounded-md transition-colors">
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>
+                        {requests.length > 0 && <span className="absolute top-1 right-1 w-2 h-2 bg-primary rounded-full" />}
+                    </button>
+                </div>
+
+                {/* Notifications Dropdown (Shadcn Popover style) */}
                 {showNoti && (
-                    <div className="mt-1 w-80 bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl glass overflow-hidden block transform origin-top-right transition-all">
-                        <div className="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-950/20">
-                            <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-500">Permintaan Pertemanan</h3>
-                            <span className="bg-blue-600 text-[9px] px-2 py-0.5 rounded-full font-bold">{requests.length}</span>
-                        </div>
-                        <div className="max-h-80 overflow-y-auto p-3 space-y-2">
-                            {requests.map(req => (
-                                <div key={req.id} className="bg-slate-950/50 p-3 rounded-2xl border border-slate-800 flex items-center justify-between gap-2">
-                                    <div className="text-[10px] font-bold truncate flex-1 text-left">
-                                        {/* Menampilkan Name, fallback ke Email */}
-                                        {req.expand.user.name || req.expand.user.email}
+                    <div className="absolute top-14 left-4 right-4 bg-popover border border-border shadow-md rounded-lg z-[60] py-2 animate-in fade-in zoom-in duration-200">
+                        <p className="px-4 py-1 text-[10px] font-bold text-muted-foreground uppercase">Requests</p>
+                        <div className="max-h-60 overflow-y-auto">
+                            {requests.length === 0 ? <p className="px-4 py-3 text-xs text-muted-foreground">No requests</p> : 
+                                requests.map(req => (
+                                    <div key={req.id} className="px-4 py-2 border-b border-border last:border-0 flex items-center justify-between gap-2">
+                                        <span className="text-xs font-medium truncate">{req.expand.user.name || req.expand.user.email}</span>
+                                        <div className="flex gap-1">
+                                            <button onClick={() => respondRequest(req.id, 'accepted')} className="px-2 py-1 bg-primary text-primary-foreground text-[10px] rounded hover:opacity-90">Accept</button>
+                                        </div>
                                     </div>
-                                    <div className="flex gap-1">
-                                        <button onClick={() => respondRequest(req.id, 'accepted')} className="bg-emerald-600 px-3 py-1.5 rounded-lg text-[10px] hover:bg-emerald-500">Terima</button>
-                                        <button onClick={() => respondRequest(req.id, 'reject')} className="bg-red-600 px-3 py-1.5 rounded-lg text-[10px] hover:bg-red-500">Tolak</button>
-                                    </div>
-                                </div>
-                            ))}
+                                ))
+                            }
                         </div>
                     </div>
                 )}
-            </div>
 
-            {/* Sidebar */}
-            <aside className="w-80 border-r border-slate-800 flex flex-col bg-slate-900/40">
-                <div className="p-6 border-b border-slate-800">
-                    <h1 className="text-xl font-black italic text-blue-400 tracking-tighter mb-4">BITLAB CHAT</h1>
-                    <div className="bg-slate-950/50 border border-slate-800 rounded-xl p-3">
-                        <p className="text-[8px] font-bold text-slate-500 uppercase mb-1">ID SAYA</p>
-                        <code className="text-[10px] font-mono text-blue-300 italic">{myUser.id}</code>
-                    </div>
-                </div>
-
-                <div className="p-4 border-b border-slate-800 bg-slate-950/30">
-                    <form onSubmit={addFriend} className="relative">
-                        <input 
-                            type="text" 
-                            value={searchId}
-                            onChange={(e) => setSearchId(e.target.value)}
-                            placeholder="Masukkan ID atau Email..." 
-                            className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2 text-[11px] outline-none focus:border-blue-500"
-                        />
-                        <button type="submit" className="absolute right-2 top-1/2 -translate-y-1/2 text-blue-500 font-bold text-[10px] hover:text-blue-300">ADD</button>
+                {/* Search / Add Friend */}
+                <div className="p-4">
+                    <form onSubmit={addFriend} className="flex gap-2">
+                        <input value={searchId} onChange={(e) => setSearchId(e.target.value)} placeholder="User ID/Email" className="flex-1 h-9 bg-transparent border border-input rounded-md px-3 text-xs focus:ring-1 focus:ring-ring outline-none" />
+                        <button type="submit" className="h-9 px-3 bg-secondary text-secondary-foreground rounded-md text-[10px] font-medium hover:bg-secondary/80 uppercase">Add</button>
                     </form>
                 </div>
 
-                <div className="flex-1 overflow-y-auto">
+                {/* Friends List */}
+                <div className="flex-1 overflow-y-auto px-2 space-y-1">
+                    <p className="px-2 text-[10px] font-medium text-muted-foreground uppercase mb-2">Messages</p>
                     {friends.map(f => {
                         const friendData = f.user === myUser.id ? f.expand.friend : f.expand.user;
+                        const isActive = activeChat?.id === friendData.id;
                         return (
-                            <div key={f.id} onClick={() => selectChat(f)} className="p-4 hover:bg-blue-500/10 cursor-pointer border-b border-slate-800/30 flex items-center gap-3 transition-all">
-                                <div className="w-10 h-10 bg-slate-800 rounded-xl flex items-center justify-center font-bold uppercase text-blue-400">
-                                    {(friendData.name || friendData.username || 'U')[0]}
+                            <button key={f.id} onClick={() => selectChat(f)} className={`w-full p-2 flex items-center gap-3 rounded-md transition-colors ${isActive ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'}`}>
+                                <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-semibold text-xs text-muted-foreground border border-border">
+                                    {(friendData.name || friendData.username || 'U')[0].toUpperCase()}
                                 </div>
-                                <div className="flex-1 overflow-hidden">
-                                    {/* PRIORITAS NAMA */}
-                                    <div className="text-xs font-bold truncate">{friendData.name || friendData.username || friendData.email}</div>
-                                    <div className="text-[9px] text-slate-500 italic">Secure Connection</div>
+                                <div className="flex-1 text-left min-w-0">
+                                    <div className="text-sm font-medium truncate">{friendData.name || friendData.username || friendData.email}</div>
+                                    <p className="text-[10px] text-muted-foreground truncate italic">Secured Session</p>
                                 </div>
-                            </div>
+                            </button>
                         );
                     })}
                 </div>
 
-                <div className="p-4 border-t border-slate-800 bg-slate-900/60 flex items-center justify-between">
-                    <div className="flex items-center gap-3 overflow-hidden">
-                        <div className="w-8 h-8 bg-blue-600 rounded-full flex-shrink-0 flex items-center justify-center text-[10px] font-black uppercase">
-                            {(myUser.name || 'M')[0]}
+                {/* Current User Info */}
+                <div className="p-4 border-t border-border flex items-center justify-between bg-muted/30">
+                    <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-8 h-8 rounded-full bg-primary flex-shrink-0 flex items-center justify-center text-[10px] font-bold text-primary-foreground">
+                            {(myUser.name || 'M')[0].toUpperCase()}
                         </div>
-                        {/* MENAMPILKAN NAMA USER LOGIN */}
-                        <p className="text-xs font-bold truncate text-slate-300">{myUser.name || myUser.username || myUser.email}</p>
+                        <div className="truncate">
+                            <p className="text-xs font-semibold truncate leading-none">{myUser.name || myUser.username}</p>
+                            <p className="text-[10px] text-muted-foreground truncate">{myUser.id}</p>
+                        </div>
                     </div>
-                    {/* LOGOUT BUTTON */}
-                    <button 
-                        onClick={handleLogout}
-                        className="p-2 hover:bg-red-500/10 rounded-lg group transition-colors"
-                        title="Logout"
-                    >
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="1.5" stroke="currentColor" className="w-5 h-5 text-slate-500 group-hover:text-red-500">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0 0 13.5 3h-6a2.25 2.25 0 0 0-2.25 2.25v13.5A2.25 2.25 0 0 0 7.5 21h6a2.25 2.25 0 0 0 2.25-2.25V15m3 0 3-3m0 0-3-3m3 3H9" />
-                        </svg>
+                    <button onClick={handleLogout} className="p-2 hover:text-destructive transition-colors">
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
                     </button>
                 </div>
             </aside>
 
             {/* Main Chat Area */}
-            <main className="flex-1 flex flex-col relative bg-slate-950">
+            <main className="flex-1 flex flex-col bg-background relative">
+                {/* Header Mobile Chat */}
+                <header className="h-14 border-b border-border flex items-center px-4 justify-between bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 sticky top-0 z-30">
+                    <div className="flex items-center gap-3">
+                        <button onClick={() => setIsSidebarOpen(true)} className="md:hidden p-2 -ml-2 hover:bg-accent rounded-md">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" /></svg>
+                        </button>
+                        {activeChat && (
+                            <div className="flex items-center gap-2 animate-in slide-in-from-left-2 duration-200">
+                                <div className="w-8 h-8 rounded-full bg-secondary flex items-center justify-center text-[10px] font-bold border border-border">
+                                    {(activeChat.name || 'U')[0].toUpperCase()}
+                                </div>
+                                <div>
+                                    <h2 className="text-sm font-semibold leading-none">{activeChat.name || activeChat.email}</h2>
+                                    <p className="text-[10px] text-emerald-500 font-medium">Encrypted</p>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </header>
+
                 {!activeChat ? (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 z-20">
-                        <p className="text-slate-600 font-bold uppercase tracking-[0.2em] text-[10px]">Pilih teman untuk chat</p>
+                    <div className="flex-1 flex flex-col items-center justify-center space-y-2">
+                        <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center">
+                            <svg className="w-6 h-6 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
+                        </div>
+                        <p className="text-xs text-muted-foreground font-medium uppercase tracking-widest">Select a conversation</p>
                     </div>
                 ) : (
                     <>
-                        <div className="p-4 border-b border-slate-800 glass z-10">
-                            <div className="flex items-center gap-3">
-                                <div className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center font-black text-xs uppercase">
-                                    {(activeChat.name || activeChat.username || 'U')[0]}
-                                </div>
-                                <div>
-                                    {/* NAMA TEMAN DI HEADER CHAT */}
-                                    <h2 className="font-bold text-sm">{activeChat.name || activeChat.username || activeChat.email}</h2>
-                                    <p className="text-[8px] text-emerald-500 font-bold uppercase tracking-widest">Double-Wrapped Security Enabled</p>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-6 space-y-4 flex flex-col">
+                        {/* Messages Box */}
+                        <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4">
                             {messages.map(msg => {
                                 let plainText = "";
                                 try {
                                     const bytes = CryptoJS.AES.decrypt(msg.text, currentChatKeyRef.current);
                                     plainText = bytes.toString(CryptoJS.enc.Utf8);
-                                } catch (e) { plainText = "🔒 [Pesan Terenkripsi]"; }
-
+                                } catch (e) { plainText = "🔒 [Encrypted]"; }
                                 const isMe = msg.sender === myUser.id;
                                 return (
-                                    <div key={msg.id} className={`max-w-[75%] p-3 rounded-2xl text-sm ${isMe ? 'bg-blue-600 self-end rounded-tr-none' : 'bg-slate-800 self-start rounded-tl-none border border-slate-700'}`}>
-                                        <p>{plainText || "🔒 [Gagal Dekripsi]"}</p>
-                                        <span className="text-[8px] opacity-30 mt-1 block text-right">
-                                            {new Date(msg.created).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                        </span>
+                                    <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-1 duration-200`}>
+                                        <div className={`max-w-[85%] md:max-w-[70%] px-4 py-2.5 rounded-2xl text-sm ${isMe ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground border border-border'}`}>
+                                            <p className="whitespace-pre-wrap break-words">{plainText || "🔒 [Decryption Error]"}</p>
+                                            <span className={`text-[8px] mt-1 block opacity-50 ${isMe ? 'text-right' : 'text-left'}`}>
+                                                {new Date(msg.created).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                            </span>
+                                        </div>
                                     </div>
                                 );
                             })}
                         </div>
 
-                        <form onSubmit={sendMessage} className="p-4 bg-slate-900/30 border-t border-slate-800">
-                            <div className="max-w-4xl mx-auto flex gap-3">
-                                <input 
-                                    type="text" 
-                                    value={inputText}
-                                    onChange={(e) => setInputText(e.target.value)}
-                                    placeholder="Tulis pesan rahasia..." 
-                                    className="flex-1 bg-slate-950 border border-slate-800 rounded-2xl px-5 py-3 text-sm outline-none focus:border-blue-500"
-                                />
-                                <button type="submit" className="bg-blue-600 px-8 rounded-2xl font-black text-[10px] uppercase hover:bg-blue-500 transition-colors">Kirim</button>
-                            </div>
-                        </form>
+                        {/* Input Area */}
+                        <div className="p-4 border-t border-border bg-background">
+                            <form onSubmit={sendMessage} className="max-w-4xl mx-auto flex gap-2">
+                                <input value={inputText} onChange={(e) => setInputText(e.target.value)} placeholder="Type a message..." className="flex-1 h-10 bg-transparent border border-input rounded-md px-4 text-sm outline-none focus:ring-1 focus:ring-ring" />
+                                <button type="submit" className="h-10 px-4 bg-primary text-primary-foreground rounded-md text-sm font-medium hover:bg-primary/90 transition-colors">Send</button>
+                            </form>
+                        </div>
                     </>
                 )}
             </main>

@@ -2,10 +2,9 @@ import type { Metadata } from "next";
 import { Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
 
-// Menggunakan font Plus Jakarta Sans agar tampilan lebih modern dan clean
 const jakarta = Plus_Jakarta_Sans({ 
   subsets: ["latin"],
-  variable: '--font-jakarta',
+  variable: '--font-jakarta', // Pastikan ini terdaftar di tailwind.config
 });
 
 export const metadata: Metadata = {
@@ -19,9 +18,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="id" className="dark">
+    // Tambahkan class 'dark' di sini untuk memaksa Dark Mode Shadcn
+    <html lang="id" className={`${jakarta.variable} dark`} style={{ colorScheme: 'dark' }}>
       <body
-        className={`${jakarta.variable} font-sans bg-slate-950 text-slate-100 antialiased selection:bg-blue-500/30`}
+        className="font-sans bg-background text-foreground antialiased selection:bg-blue-500/30"
       >
         {children}
       </body>

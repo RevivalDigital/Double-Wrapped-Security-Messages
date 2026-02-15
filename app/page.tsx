@@ -20,10 +20,11 @@ export default function ChatPage() {
   const [inputText, setInputText] = useState("");
   const [searchId, setSearchId] = useState("");
   const [showNoti, setShowNoti] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+  const [loadingMessages, setLoadingMessages] = useState(false);
 
   const chatBoxRef = useRef<HTMLDivElement>(null);
-  const activeChatRef = useRef<any>(null);
   const currentChatKeyRef = useRef<string>("");
 
   // ================= ENCRYPTION =================
@@ -48,85 +49,53 @@ export default function ChatPage() {
     ).toString();
   };
 
+  // ================= LOAD NOTIFICATIONS =================
+
+  const loadNotifications = async () => {
+    try {
+      const myId = pb.authStore.model?.id;
+      if (!myId) return;
+
+      const result = await pb.collection("notifications").getFullList({
+        filter: `user="${myId}" && is_read=false`,
+      });
+
+      const grouped: Record<string, number> = {};
+      result.forEach((n: any) => {
+        grouped[n.sender] = (grouped[n.sender] || 0) + 1;
+      });
+
+      setUnreadCounts(grouped);
+    } catch (err) {
+      console.error("Load notification error:", err);
+    }
+  };
+
   // ================= LOAD FRIENDS =================
 
   const loadFriends = async () => {
-    const myId = pb.authStore.model?.id;
-    if (!myId) return;
+    try {
+      const userId = pb.authStore.model?.id;
+      if (!userId) return;
 
-    const records = await pb.collection("friends").getFullList({
-      expand: "user,friend",
-      filter: `user="${myId}" || friend="${myId}"`,
-      sort: "-updated",
-    });
+      const records = await pb.collection("friends").getFullList({
+        expand: "user,friend",
+        filter: `user="${userId}" || friend="${userId}"`,
+        sort: "-updated",
+      });
 
-    setFriends(records.filter((r) => r.status === "accepted"));
-    setRequests(
-      records.filter(
-        (r) => r.status === "pending" && r.friend === myId
-      )
-    );
+      setFriends(records.filter((r) => r.status === "accepted"));
+      setRequests(
+        records.filter(
+          (r) => r.status === "pending" && r.friend === userId
+        )
+      );
+    } catch (err) {
+      console.error(err);
+    }
   };
 
-  // ================= LOAD MESSAGES =================
-
-  const loadMessages = async (friendRecord: any) => {
-    if (!myUser) return;
-
-    const friendData =
-      friendRecord.user === myUser.id
-        ? friendRecord.expand.friend
-        : friendRecord.expand.user;
-
-    const salt =
-      decryptSalt(friendRecord.chat_salt) || "fallback";
-
-    const key = generateChatKey(
-      myUser.id,
-      friendData.id,
-      salt
-    );
-
-    currentChatKeyRef.current = key;
-    activeChatRef.current = friendData;
-    setActiveChat(friendData);
-
-    const res = await pb.collection("messages").getFullList({
-      filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
-      sort: "created",
-    });
-
-    setMessages(res);
-
-    // reset unread count
-    setUnreadCounts((prev) => {
-      const copy = { ...prev };
-      delete copy[friendData.id];
-      return copy;
-    });
-  };
-
-  // ================= SEND MESSAGE =================
-
-  const sendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputText.trim() || !activeChatRef.current) return;
-
-    const encrypted = CryptoJS.AES.encrypt(
-      inputText.trim(),
-      currentChatKeyRef.current
-    ).toString();
-
-    await pb.collection("messages").create({
-      sender: myUser.id,
-      receiver: activeChatRef.current.id,
-      text: encrypted,
-    });
-
-    setInputText("");
-  };
-
-  // ================= REALTIME INIT (ONCE ONLY) =================
+  // ================= REALTIME =================
 
   useEffect(() => {
     if (!pb.authStore.isValid) {
@@ -134,17 +103,19 @@ export default function ChatPage() {
       return;
     }
 
-    const user = pb.authStore.model;
-    setMyUser(user);
-    loadFriends();
+    const init = async () => {
+      setMyUser(pb.authStore.model);
+      await loadFriends();
+      await loadNotifications();
+    };
+
+    init();
 
     if ("Notification" in window) {
       Notification.requestPermission();
     }
 
-    pb.collection("friends").subscribe("*", () => {
-      loadFriends();
-    });
+    pb.collection("friends").subscribe("*", () => loadFriends());
 
     pb.collection("messages").subscribe("*", async (e) => {
       if (e.action !== "create") return;
@@ -153,39 +124,44 @@ export default function ChatPage() {
       const myId = pb.authStore.model?.id;
       if (!myId) return;
 
-      const active = activeChatRef.current;
+      const isForMe = msg.receiver === myId;
 
-      const isRelevant =
-        active &&
-        ((msg.sender === myId &&
-          msg.receiver === active.id) ||
-          (msg.sender === active.id &&
-            msg.receiver === myId));
+      if (isForMe) {
+        try {
+          await pb.collection("notifications").create({
+            user: myId,
+            sender: msg.sender,
+            title: "Pesan Baru",
+            message: "Kamu menerima pesan baru",
+            is_read: false,
+            related_id: msg.id,
+          });
+        } catch (err) {
+          console.error("Save notification error:", err);
+        }
 
-      if (isRelevant) {
-        setMessages((prev) => [...prev, msg]);
+        await loadNotifications();
       }
 
       if (
-        msg.receiver === myId &&
-        (!active || msg.sender !== active.id)
+        activeChat &&
+        ((msg.sender === myId &&
+          msg.receiver === activeChat.id) ||
+          (msg.sender === activeChat.id &&
+            msg.receiver === myId))
       ) {
-        setUnreadCounts((prev) => ({
-          ...prev,
-          [msg.sender]: (prev[msg.sender] || 0) + 1,
-        }));
-
-        if (Notification.permission === "granted") {
-          new Notification("Pesan Baru", {
-            body: "Pesan rahasia baru",
-          });
-        }
+        setMessages((prev) => [...prev, msg]);
       }
     });
+
+    pb.collection("notifications").subscribe("*", () =>
+      loadNotifications()
+    );
 
     return () => {
       pb.collection("friends").unsubscribe();
       pb.collection("messages").unsubscribe();
+      pb.collection("notifications").unsubscribe();
     };
   }, []);
 
@@ -195,7 +171,66 @@ export default function ChatPage() {
         chatBoxRef.current.scrollHeight;
   }, [messages]);
 
-  // ================= UI =================
+  // ================= SELECT CHAT =================
+
+  const selectChat = async (friendRecord: any) => {
+    if (!myUser?.id) return;
+
+    setLoadingMessages(true);
+    setMessages([]);
+
+    const friendData =
+      friendRecord.user === myUser.id
+        ? friendRecord.expand?.friend
+        : friendRecord.expand?.user;
+
+    if (!friendData) return;
+
+    const salt =
+      decryptSalt(friendRecord.chat_salt) || "fallback";
+    const key = generateChatKey(
+      myUser.id,
+      friendData.id,
+      salt
+    );
+    currentChatKeyRef.current = key;
+    setActiveChat(friendData);
+
+    const res = await pb.collection("messages").getFullList({
+      filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
+      sort: "created",
+    });
+
+    setMessages(res);
+    setLoadingMessages(false);
+
+    await pb.collection("notifications").update(
+      undefined,
+      { is_read: true }
+    );
+
+    await loadNotifications();
+  };
+
+  // ================= SEND MESSAGE =================
+
+  const sendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputText.trim() || !activeChat) return;
+
+    const encrypted = CryptoJS.AES.encrypt(
+      inputText.trim(),
+      currentChatKeyRef.current
+    ).toString();
+
+    await pb.collection("messages").create({
+      sender: myUser.id,
+      receiver: activeChat.id,
+      text: encrypted,
+    });
+
+    setInputText("");
+  };
 
   if (!myUser)
     return (
@@ -205,64 +240,85 @@ export default function ChatPage() {
     );
 
   return (
-    <div className="flex h-screen bg-black text-white">
+    <div className="flex h-screen bg-background text-foreground">
       {/* SIDEBAR */}
-      <aside className="w-80 border-r border-gray-800 flex flex-col">
-        <div className="p-4 font-bold">Bitlab Chat</div>
+      <aside className="w-80 border-r border-border flex flex-col">
+        <div className="p-4 font-bold flex justify-between">
+          Bitlab Chat
+          <div className="relative">
+            <button onClick={() => setShowNoti(!showNoti)}>
+              🔔
+            </button>
+            {Object.values(unreadCounts).reduce(
+              (a, b) => a + b,
+              0
+            ) > 0 && (
+              <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs px-2 rounded-full">
+                {Object.values(unreadCounts).reduce(
+                  (a, b) => a + b,
+                  0
+                )}
+              </span>
+            )}
+          </div>
+        </div>
 
-        <div className="flex-1 overflow-y-auto px-2 space-y-1">
+        <div className="flex-1 overflow-y-auto px-2">
           {friends.map((f) => {
             const friendData =
               f.user === myUser.id
                 ? f.expand?.friend
                 : f.expand?.user;
 
-            const unread = unreadCounts[friendData?.id] || 0;
+            if (!friendData) return null;
 
             return (
               <button
                 key={f.id}
-                onClick={() => loadMessages(f)}
-                className="w-full p-2 flex justify-between hover:bg-gray-800 rounded"
+                onClick={() => selectChat(f)}
+                className="w-full p-2 hover:bg-accent rounded text-left"
               >
-                <span>
-                  {friendData?.name ||
-                    friendData?.username ||
-                    friendData?.email}
-                </span>
-                {unread > 0 && (
-                  <span className="bg-red-500 text-xs px-2 rounded-full">
-                    {unread}
-                  </span>
-                )}
+                {friendData.name ||
+                  friendData.username ||
+                  friendData.email}
               </button>
             );
           })}
         </div>
 
         {/* PROFILE */}
-        <div className="p-4 border-t border-gray-800">
-          <p className="font-semibold">
-            {myUser.username || myUser.email}
-          </p>
+        <div className="p-4 border-t border-border">
           <button
-            className="text-red-400 text-sm mt-1"
-            onClick={() => {
-              pb.authStore.clear();
-              window.location.href = "/login";
-            }}
+            onClick={() =>
+              (window.location.href = "/profile")
+            }
+            className="w-full flex items-center gap-2"
           >
-            Logout
+            {myUser.avatar ? (
+              <img
+                src={`${PB_URL}/api/files/_pb_users_auth_/${myUser.id}/${myUser.avatar}`}
+                className="w-8 h-8 rounded-full"
+              />
+            ) : (
+              <div className="w-8 h-8 bg-primary rounded-full flex items-center justify-center text-xs">
+                {(myUser.name || "U")[0]}
+              </div>
+            )}
+            <span>
+              {myUser.name ||
+                myUser.username ||
+                myUser.email}
+            </span>
           </button>
         </div>
       </aside>
 
-      {/* CHAT AREA */}
+      {/* CHAT */}
       <main className="flex-1 flex flex-col">
-        <div className="p-4 border-b border-gray-800 font-semibold">
+        <div className="p-4 border-b border-border font-semibold">
           {activeChat
             ? activeChat.name || activeChat.email
-            : "Pilih Chat"}
+            : "Select Chat"}
         </div>
 
         <div
@@ -293,21 +349,21 @@ export default function ChatPage() {
                 }`}
               >
                 <div
-                  className={`max-w-xs px-4 py-2 rounded-xl ${
+                  className={`px-4 py-2 rounded-xl ${
                     isMe
-                      ? "bg-blue-600"
-                      : "bg-gray-800"
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-card border border-border"
                   }`}
                 >
                   <p>{plain}</p>
-                  <div className="text-xs text-gray-300 mt-1 text-right">
+                  <span className="text-xs opacity-50">
                     {new Date(
                       msg.created
                     ).toLocaleTimeString([], {
                       hour: "2-digit",
                       minute: "2-digit",
                     })}
-                  </div>
+                  </span>
                 </div>
               </div>
             );
@@ -317,17 +373,17 @@ export default function ChatPage() {
         {activeChat && (
           <form
             onSubmit={sendMessage}
-            className="p-4 border-t border-gray-800 flex gap-2"
+            className="p-4 border-t border-border flex gap-2"
           >
             <input
               value={inputText}
               onChange={(e) =>
                 setInputText(e.target.value)
               }
-              className="flex-1 bg-gray-900 border border-gray-700 rounded-full px-4 py-2"
+              className="flex-1 border rounded px-4 py-2"
               placeholder="Type message..."
             />
-            <button className="bg-blue-600 px-4 rounded-full">
+            <button className="bg-primary text-white px-4 rounded">
               Send
             </button>
           </form>

@@ -368,7 +368,8 @@ export default function ChatPage() {
         try {
             const res = await pb.collection('messages').getList(1, 50, {
                 filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
-                sort: '-created' // Descending (terbaru dulu)
+                sort: '-created', // Descending (terbaru dulu)
+                $autoCancel: false // Allow multiple requests (no auto-cancel)
             });
             
             const freshMessages = res.items.reverse();
@@ -382,6 +383,24 @@ export default function ChatPage() {
             
         } catch (err: any) {
             console.error('Error loading messages:', err);
+            
+            // Ignore auto-cancel errors (happens when user switches chat quickly)
+            const isAutoCancel = 
+                err?.isAbort || 
+                err?.name === 'AbortError' ||
+                err?.message?.includes('autocancelled') ||
+                err?.message?.includes('aborted');
+            
+            if (isAutoCancel) {
+                console.log('⏭️ Request cancelled (user switched chat or duplicate request)');
+                // Don't show error, just keep cache if available
+                if (!cachedMessages) {
+                    setLoadingMessages(false);
+                }
+                return;
+            }
+            
+            // Real errors - show error state
             const errorMsg = err?.message || 'Failed to load messages';
             setLoadError(errorMsg);
             

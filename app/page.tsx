@@ -12,16 +12,19 @@ const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "";
 const INTERNAL_APP_KEY = KEY1 + KEY2;
 
 // Component untuk menampilkan friend item dengan unread count
-function FriendItem({ friendRecord, friendData, activeChat, selectChat, getUnreadCount }: any) {
+function FriendItem({ friendRecord, friendData, activeChat, selectChat, getUnreadCount, refreshKey }: any) {
     const [unreadCount, setUnreadCount] = useState(0);
+    const [loading, setLoading] = useState(true);
 
     useEffect(() => {
         const fetchUnread = async () => {
+            setLoading(true);
             const count = await getUnreadCount(friendData?.id, friendRecord);
             setUnreadCount(count);
+            setLoading(false);
         };
         fetchUnread();
-    }, [friendRecord, friendData]);
+    }, [friendRecord.id, friendRecord.last_read_user, friendRecord.last_read_friend, refreshKey]);
 
     return (
         <button onClick={() => selectChat(friendRecord)} className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/40'}`}>
@@ -56,6 +59,7 @@ export default function ChatPage() {
     const [showNoti, setShowNoti] = useState(false);
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
     const [totalUnread, setTotalUnread] = useState(0);
+    const [friendsKey, setFriendsKey] = useState(0); // Force re-render friends list
     
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
@@ -97,6 +101,8 @@ export default function ChatPage() {
                 total += count;
             }
             setTotalUnread(total);
+            setFriendsKey(prev => prev + 1); // Force re-render
+            console.log('Total unread messages:', total);
         } catch (err) { console.error(err); }
     };
 
@@ -143,6 +149,7 @@ export default function ChatPage() {
                 fields: 'id'
             });
             
+            console.log(`Unread for ${friendId}:`, unreadMessages.totalItems, 'lastRead:', lastRead);
             return unreadMessages.totalItems;
         } catch (err) {
             console.error('Error getting unread count:', err);
@@ -172,12 +179,18 @@ export default function ChatPage() {
                 const isFromMe = msg.sender === myId;
                 const isFromActive = activeChat && msg.sender === activeChat.id;
 
-                // Sync UI jika chat sedang dibuka
-                if (isFromActive || isFromMe) {
-                    setMessages(prev => [...prev, msg]);
+                // Sync UI jika chat sedang dibuka - untuk pesan masuk ATAU keluar
+                if (activeChat) {
+                    const isChatWithActive = 
+                        (isFromActive && isForMe) || // Pesan masuk dari active chat
+                        (isFromMe && msg.receiver === activeChat.id); // Pesan keluar ke active chat
+                    
+                    if (isChatWithActive) {
+                        setMessages(prev => [...prev, msg]);
+                    }
                 }
 
-                // Notifikasi jika tab sedang di-minimize atau sedang buka chat orang lain
+                // Notifikasi jika pesan untuk saya dan bukan dari active chat
                 if (isForMe && !isFromActive) {
                     // Get sender name for notification
                     try {
@@ -308,12 +321,13 @@ export default function ChatPage() {
                         const friendData = f.user === myUser.id ? f.expand?.friend : f.expand?.user;
                         return (
                             <FriendItem 
-                                key={f.id} 
+                                key={`${f.id}-${friendsKey}`}
                                 friendRecord={f} 
                                 friendData={friendData} 
                                 activeChat={activeChat} 
                                 selectChat={selectChat}
                                 getUnreadCount={getUnreadCount}
+                                refreshKey={friendsKey}
                             />
                         );
                     })}

@@ -238,12 +238,31 @@ export default function ChatPage() {
                 const myId = pb.authStore.model?.id;
                 if (!myId) return; // Guard clause
                 
+                console.log('📨 New message received:', {
+                    from: msg.sender,
+                    to: msg.receiver,
+                    myId,
+                    activeChat: activeChat?.id
+                });
+                
                 const isForMe = msg.receiver === myId;
                 const isFromMe = msg.sender === myId;
                 const isFromActive = activeChat && msg.sender === activeChat.id;
+                const isToActive = activeChat && msg.receiver === activeChat.id;
 
-                // Sync UI jika chat sedang dibuka
-                if (isFromActive || isFromMe) {
+                // Sync UI jika chat sedang dibuka DAN pesan memang untuk chat ini
+                // Pesan harus antara myId dan activeChat.id
+                const isRelevantToActiveChat = activeChat && (
+                    (msg.sender === myId && msg.receiver === activeChat.id) ||        // Saya kirim ke active
+                    (msg.sender === activeChat.id && msg.receiver === myId)           // Active kirim ke saya
+                );
+
+                console.log('🔍 Message relevance:', {
+                    isRelevantToActiveChat,
+                    willAddToUI: isRelevantToActiveChat
+                });
+
+                if (isRelevantToActiveChat) {
                     setMessages(prev => {
                         const updated = [...prev, msg];
                         
@@ -288,6 +307,8 @@ export default function ChatPage() {
     const selectChat = async (friendRecord: any) => {
         if (!myUser?.id) return; // Guard clause untuk TypeScript
         
+        // Clear messages immediately saat ganti chat
+        setMessages([]);
         setLoadingMessages(true);
         setLoadError(null);
         setIsLoadingTimeout(false);
@@ -310,7 +331,10 @@ export default function ChatPage() {
         const key = generateChatKey(myUser.id, friendData.id, salt);
         currentChatKeyRef.current = key;
         
+        // Set activeChat SEBELUM load messages (penting untuk real-time filter)
         setActiveChat({ ...friendData, salt, friendRecordId: friendRecord.id });
+        
+        console.log('🔄 Switching to chat with:', friendData.id, friendData.name || friendData.email);
         
         // Reset unread count untuk friend ini (di memory)
         setUnreadCounts(prev => {

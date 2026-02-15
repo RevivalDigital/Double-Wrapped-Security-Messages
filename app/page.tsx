@@ -1,269 +1,282 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { pb } from "@/lib/pb";
-import CryptoJS from "crypto-js";
-import type { RecordModel } from "pocketbase";
+import { useEffect, useState, useRef } from "react";
+import PocketBase from "pocketbase";
+import * as CryptoJS from "crypto-js";
 
-interface FriendRecord extends RecordModel {
-  user: string;
-  friend: string;
-  expand?: {
-    friend?: {
-      id: string;
-      username: string;
-    };
-  };
-}
+const PB_URL = process.env.NEXT_PUBLIC_PB_URL || "";
+const pb = new PocketBase(PB_URL);
 
-interface Message {
-  id: string;
-  sender: string;
-  receiver: string;
-  text: string;
-  created: string;
-}
-
-interface ActiveChat {
-  id: string;
-  username: string;
-  chatKey: string;
-}
-
-function mapRecordToMessage(record: RecordModel): Message {
-  return {
-    id: record.id,
-    sender: record.get("sender"),
-    receiver: record.get("receiver"),
-    text: record.get("text"),
-    created: record.created,
-  };
-}
+const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "";
+const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "";
+const INTERNAL_APP_KEY = KEY1 + KEY2;
 
 export default function ChatPage() {
-  const myId = pb.authStore.model?.id;
-
-  const [friends, setFriends] = useState<FriendRecord[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [activeChat, setActiveChat] = useState<ActiveChat | null>(null);
-  const [newMessage, setNewMessage] = useState("");
+  const [myUser, setMyUser] = useState<any>(null);
+  const [friends, setFriends] = useState<any[]>([]);
+  const [requests, setRequests] = useState<any[]>([]);
+  const [activeChat, setActiveChat] = useState<any>(null);
+  const [messages, setMessages] = useState<any[]>([]);
+  const [inputText, setInputText] = useState("");
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [loadingMessages, setLoadingMessages] = useState(false);
 
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const chatBoxRef = useRef<HTMLDivElement>(null);
+  const currentChatKeyRef = useRef<string>("");
+  const activeChatRef = useRef<any>(null);
+
+  // =========================
+  // ENCRYPTION
+  // =========================
+  const encryptSalt = (raw: string) =>
+    CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
+
+  const decryptSalt = (enc: string) => {
+    try {
+      const bytes = CryptoJS.AES.decrypt(enc, INTERNAL_APP_KEY);
+      return bytes.toString(CryptoJS.enc.Utf8);
+    } catch {
+      return null;
+    }
+  };
+
+  const generateChatKey = (id1: string, id2: string, salt: string) => {
+    const combined = [id1, id2].sort().join("");
+    return CryptoJS.SHA256(combined + salt + INTERNAL_APP_KEY).toString();
+  };
 
   // =========================
   // LOAD FRIENDS
   // =========================
+  const loadFriends = async () => {
+    const userId = pb.authStore.model?.id;
+    if (!userId) return;
+
+    const records = await pb.collection("friends").getFullList({
+      expand: "user,friend",
+      filter: `user="${userId}" || friend="${userId}"`,
+    });
+
+    setFriends(records.filter((r: any) => r.status === "accepted"));
+    setRequests(
+      records.filter(
+        (r: any) => r.status === "pending" && r.friend === userId
+      )
+    );
+  };
+
+  // =========================
+  // INIT
+  // =========================
   useEffect(() => {
-    if (!myId) return;
+    if (!pb.authStore.isValid) {
+      window.location.href = "/login";
+      return;
+    }
 
-    const loadFriends = async () => {
-      const res = await pb.collection("friends").getFullList({
-        filter: `user="${myId}"`,
-        expand: "friend",
-      });
-
-      setFriends(res as FriendRecord[]);
-    };
-
+    setMyUser(pb.authStore.model);
     loadFriends();
-  }, [myId]);
 
-  // =========================
-  // REALTIME SUBSCRIBE
-  // =========================
-  useEffect(() => {
-    if (!myId) return;
+    // CLEAN BEFORE SUBSCRIBE
+    pb.collection("messages").unsubscribe();
+    pb.collection("friends").unsubscribe();
 
-    const subscribe = async () => {
-      await pb.collection("messages").subscribe(
-        `receiver="${myId}" || sender="${myId}"`,
-        (e) => {
-          if (e.action !== "create") return;
+    pb.collection("friends").subscribe("*", () => loadFriends());
 
-          const msg = mapRecordToMessage(e.record);
+    // GLOBAL MESSAGE REALTIME (ONCE ONLY)
+    pb.collection("messages").subscribe("*", (e) => {
+      if (e.action !== "create") return;
 
-          setMessages((prev) => {
-            if (!activeChat) return prev;
+      const msg = e.record;
+      const myId = pb.authStore.model?.id;
+      if (!myId) return;
 
-            const isRelevant =
-              (msg.sender === myId && msg.receiver === activeChat.id) ||
-              (msg.sender === activeChat.id && msg.receiver === myId);
+      const active = activeChatRef.current;
 
-            if (!isRelevant) return prev;
+      const isRelevant =
+        active &&
+        ((msg.sender === myId && msg.receiver === active.id) ||
+          (msg.sender === active.id && msg.receiver === myId));
 
-            return [...prev, msg];
-          });
-        }
-      );
-    };
+      if (isRelevant) {
+        setMessages((prev) => {
+          if (prev.find((m) => m.id === msg.id)) return prev;
+          return [...prev, msg];
+        });
+      }
 
-    subscribe();
+      if (msg.receiver === myId && (!active || msg.sender !== active.id)) {
+        setUnreadCounts((prev) => ({
+          ...prev,
+          [msg.sender]: (prev[msg.sender] || 0) + 1,
+        }));
+      }
+    });
 
     return () => {
       pb.collection("messages").unsubscribe();
+      pb.collection("friends").unsubscribe();
     };
-  }, [myId, activeChat]);
+  }, []);
 
   // =========================
-  // LOAD MESSAGES
+  // SCROLL
   // =========================
-  const loadMessages = async (friendId: string) => {
-    if (!myId) return;
-
-    setLoadingMessages(true);
-    setMessages([]);
-
-    const res = await pb.collection("messages").getList(1, 100, {
-      filter: `(sender="${myId}" && receiver="${friendId}") || (sender="${friendId}" && receiver="${myId}")`,
-      sort: "created",
-    });
-
-    const mapped = res.items.map((item) => mapRecordToMessage(item));
-    setMessages(mapped);
-
-    setLoadingMessages(false);
-  };
+  useEffect(() => {
+    if (chatBoxRef.current) {
+      chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+    }
+  }, [messages]);
 
   // =========================
   // SELECT CHAT
   // =========================
-  const selectChat = async (friend: FriendRecord) => {
-    const friendId = friend.expand?.friend?.id;
-    const username = friend.expand?.friend?.username;
+  const selectChat = async (friendRecord: any) => {
+    if (!myUser?.id) return;
 
-    if (!friendId || !myId) return;
+    setMessages([]);
+    setLoadingMessages(true);
 
-    const salt = [myId, friendId].sort().join(":");
-    const chatKey = CryptoJS.SHA256(salt).toString();
+    const friendData =
+      friendRecord.user === myUser.id
+        ? friendRecord.expand.friend
+        : friendRecord.expand.user;
 
-    setActiveChat({
-      id: friendId,
-      username: username || "Unknown",
-      chatKey,
+    const salt = decryptSalt(friendRecord.chat_salt) || "fallback";
+    const key = generateChatKey(myUser.id, friendData.id, salt);
+
+    currentChatKeyRef.current = key;
+    activeChatRef.current = friendData;
+    setActiveChat(friendData);
+
+    setUnreadCounts((prev) => {
+      const updated = { ...prev };
+      delete updated[friendData.id];
+      return updated;
     });
 
-    await loadMessages(friendId);
+    const res = await pb.collection("messages").getList(1, 50, {
+      filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
+      sort: "created",
+      $autoCancel: false,
+    });
+
+    setMessages(res.items);
+    setLoadingMessages(false);
   };
 
   // =========================
   // SEND MESSAGE
   // =========================
-  const sendMessage = async () => {
-    if (!newMessage.trim() || !activeChat || !myId) return;
+  const sendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputText.trim() || !activeChat) return;
 
     const encrypted = CryptoJS.AES.encrypt(
-      newMessage,
-      activeChat.chatKey
+      inputText.trim(),
+      currentChatKeyRef.current
     ).toString();
 
     await pb.collection("messages").create({
-      sender: myId,
+      sender: myUser.id,
       receiver: activeChat.id,
       text: encrypted,
     });
 
-    setNewMessage("");
+    setInputText("");
   };
 
-  // =========================
-  // AUTO SCROLL
-  // =========================
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  if (!myUser)
+    return (
+      <div className="h-screen flex items-center justify-center">
+        Initializing...
+      </div>
+    );
 
-  // =========================
-  // RENDER
-  // =========================
   return (
     <div className="flex h-screen">
-
-      {/* FRIEND LIST */}
-      <div className="w-1/4 border-r p-4 overflow-y-auto">
+      <aside className="w-72 border-r p-4 overflow-y-auto">
         <h2 className="font-bold mb-4">Friends</h2>
-
         {friends.map((f) => {
-          const friendId = f.expand?.friend?.id;
+          const friendData =
+            f.user === myUser.id ? f.expand.friend : f.expand.user;
+          const unread = unreadCounts[friendData.id] || 0;
 
           return (
-            <div
+            <button
               key={f.id}
               onClick={() => selectChat(f)}
-              className={`p-2 cursor-pointer rounded ${
-                activeChat?.id === friendId
+              className={`w-full text-left p-2 rounded mb-2 ${
+                activeChat?.id === friendData.id
                   ? "bg-blue-200"
                   : "hover:bg-gray-100"
               }`}
             >
-              {f.expand?.friend?.username}
-            </div>
+              {friendData.name || friendData.email}
+              {unread > 0 && (
+                <span className="ml-2 text-red-500 text-xs font-bold">
+                  ({unread})
+                </span>
+              )}
+            </button>
           );
         })}
-      </div>
+      </aside>
 
-      {/* CHAT AREA */}
-      <div className="flex-1 flex flex-col">
-
-        {/* HEADER */}
-        <div className="p-4 border-b font-bold">
-          {activeChat ? activeChat.username : "Select a chat"}
+      <main className="flex-1 flex flex-col">
+        <div className="border-b p-4 font-bold">
+          {activeChat
+            ? activeChat.name || activeChat.email
+            : "Select a chat"}
         </div>
 
-        {/* MESSAGES */}
-        <div className="flex-1 p-4 overflow-y-auto space-y-2">
-          {loadingMessages && <div>Loading...</div>}
-
-          {messages.map((msg) => {
-            let plainText = "";
-
-            try {
-              if (activeChat?.chatKey) {
+        <div
+          ref={chatBoxRef}
+          className="flex-1 overflow-y-auto p-4 space-y-3"
+        >
+          {loadingMessages ? (
+            <div>Loading...</div>
+          ) : (
+            messages.map((msg) => {
+              let plain = "";
+              try {
                 const bytes = CryptoJS.AES.decrypt(
                   msg.text,
-                  activeChat.chatKey
+                  currentChatKeyRef.current
                 );
-                plainText = bytes.toString(CryptoJS.enc.Utf8);
-              }
-            } catch {
-              plainText = "[Decrypt error]";
-            }
+                plain = bytes.toString(CryptoJS.enc.Utf8);
+              } catch {}
 
-            const isMine = msg.sender === myId;
+              const isMe = msg.sender === myUser.id;
 
-            return (
-              <div
-                key={msg.id}
-                className={`max-w-xs p-2 rounded text-white ${
-                  isMine ? "bg-blue-500 ml-auto" : "bg-gray-500"
-                }`}
-              >
-                {plainText || "[Invalid message]"}
-              </div>
-            );
-          })}
-
-          <div ref={bottomRef} />
+              return (
+                <div
+                  key={msg.id}
+                  className={`max-w-xs p-2 rounded text-white ${
+                    isMe ? "bg-blue-500 ml-auto" : "bg-gray-500"
+                  }`}
+                >
+                  {plain || "🔒 [Decrypt Error]"}
+                </div>
+              );
+            })
+          )}
         </div>
 
-        {/* INPUT */}
         {activeChat && (
-          <div className="p-4 border-t flex">
+          <form onSubmit={sendMessage} className="p-4 border-t flex">
             <input
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
               className="flex-1 border rounded p-2 mr-2"
-              value={newMessage}
-              onChange={(e) => setNewMessage(e.target.value)}
               placeholder="Type message..."
             />
-            <button
-              onClick={sendMessage}
-              className="bg-blue-500 text-white px-4 rounded"
-            >
+            <button className="bg-blue-500 text-white px-4 rounded">
               Send
             </button>
-          </div>
+          </form>
         )}
-      </div>
+      </main>
     </div>
   );
 }

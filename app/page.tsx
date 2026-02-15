@@ -4,11 +4,12 @@ import { useEffect, useState, useRef } from 'react';
 import PocketBase from 'pocketbase';
 import * as CryptoJS from 'crypto-js';
 
-const PB_URL = process.env.NEXT_PUBLIC_PB_URL;
+// --- CONFIG FROM ENV ---
+const PB_URL = process.env.NEXT_PUBLIC_PB_URL || "";
 const pb = new PocketBase(PB_URL);
 
-const KEY1 = process.env.NEXT_PUBLIC_KEY1;
-const KEY2 = process.env.NEXT_PUBLIC_KEY2;
+const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "";
+const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "";
 const INTERNAL_APP_KEY = KEY1 + KEY2;
 
 export default function ChatPage() {
@@ -77,6 +78,27 @@ export default function ChatPage() {
         window.location.href = "/login";
     };
 
+    // --- PUSH NOTIFICATION SETUP ---
+    const setupNotifications = () => {
+        if (typeof window !== "undefined" && "Notification" in window && "serviceWorker" in navigator) {
+            Notification.requestPermission().then(permission => {
+                if (permission === "granted") {
+                    navigator.serviceWorker.register("/sw.js")
+                        .then(() => console.log("Service Worker Active"));
+                }
+            });
+        }
+    };
+
+    const triggerLocalNotification = (senderName: string) => {
+        if (document.visibilityState === "hidden" && Notification.permission === "granted") {
+            new Notification("Pesan Baru", {
+                body: `Pesan rahasia baru dari ${senderName}`,
+                icon: "/icon.png"
+            });
+        }
+    };
+
     // --- EFFECTS ---
     useEffect(() => {
         if (!pb.authStore.isValid) {
@@ -85,6 +107,7 @@ export default function ChatPage() {
         }
         setMyUser(pb.authStore.model);
         loadFriends();
+        setupNotifications();
         
         if (window.innerWidth < 768 && activeChat) {
             setIsSidebarOpen(false);
@@ -107,7 +130,7 @@ export default function ChatPage() {
         currentChatKeyRef.current = key;
         setActiveChat({ ...friendData, salt });
         loadMessages(friendData.id);
-        subscribeMessages(friendData.id);
+        subscribeMessages(friendData.id, friendData.name || friendData.email);
         if (window.innerWidth < 768) setIsSidebarOpen(false);
     };
 
@@ -119,13 +142,22 @@ export default function ChatPage() {
         setMessages(res);
     };
 
-    const subscribeMessages = async (friendId: string) => {
+    const subscribeMessages = async (friendId: string, friendName: string) => {
         await pb.collection('messages').unsubscribe('*');
         await pb.collection('messages').subscribe('*', (e) => {
-            if (e.action === 'create' && 
-               ((e.record.sender === myUser.id && e.record.receiver === friendId) || 
-                (e.record.sender === friendId && e.record.receiver === myUser.id))) {
-                setMessages(prev => [...prev, e.record]);
+            if (e.action === 'create') {
+                const isFromMe = e.record.sender === myUser.id;
+                const isFromTarget = e.record.sender === friendId;
+                const isForMe = e.record.receiver === myUser.id;
+
+                if (isFromMe || isFromTarget) {
+                    setMessages(prev => [...prev, e.record]);
+                }
+
+                if (isForMe) {
+                    // Gunakan friendName yang di-pass dari selectChat
+                    triggerLocalNotification(isFromTarget ? friendName : "Seseorang");
+                }
             }
         });
     };
@@ -148,44 +180,31 @@ export default function ChatPage() {
         }
 
         try {
-            // 1. Cari user target
             const userList = await pb.collection('users').getList(1, 1, { 
                 filter: `id = "${input}" || email = "${input}"` 
             });
 
-            if (userList.items.length === 0) {
-                return alert("User tidak ditemukan.");
-            }
-
+            if (userList.items.length === 0) return alert("User tidak ditemukan.");
             const target = userList.items[0];
 
-            // 2. Cek apakah sudah ada hubungan (Pending atau Accepted)
             const existing = await pb.collection('friends').getList(1, 1, {
                 filter: `(user = "${myUser.id}" && friend = "${target.id}") || (user = "${target.id}" && friend = "${myUser.id}")`
             });
 
             if (existing.items.length > 0) {
-                const relation = existing.items[0];
-                if (relation.status === 'accepted') {
-                    return alert("Anda sudah berteman dengan user ini.");
-                } else {
-                    return alert("Permintaan pertemanan sudah ada (menunggu konfirmasi).");
-                }
+                const status = existing.items[0].status;
+                return alert(status === 'accepted' ? "Sudah berteman." : "Permintaan sudah dikirim.");
             }
 
-            // 3. Jika bersih, buat permintaan baru
             await pb.collection('friends').create({ 
                 user: myUser.id, 
                 friend: target.id, 
                 status: 'pending' 
             });
 
-            alert("Permintaan pertemanan berhasil dikirim!");
+            alert("Permintaan terkirim!");
             setSearchId("");
-        } catch (err) { 
-            console.error(err);
-            alert("Gagal mengirim permintaan."); 
-        }
+        } catch (err) { alert("Gagal kirim permintaan."); }
     };
 
     if (!myUser) return <div className="h-screen flex items-center justify-center bg-background text-foreground animate-pulse">Initializing...</div>;

@@ -11,43 +11,6 @@ const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "";
 const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "";
 const INTERNAL_APP_KEY = KEY1 + KEY2;
 
-// Component untuk menampilkan friend item dengan unread count
-function FriendItem({ friendRecord, friendData, activeChat, selectChat, getUnreadCount, refreshKey }: any) {
-    const [unreadCount, setUnreadCount] = useState(0);
-    const [loading, setLoading] = useState(true);
-
-    useEffect(() => {
-        const fetchUnread = async () => {
-            setLoading(true);
-            const count = await getUnreadCount(friendData?.id, friendRecord);
-            setUnreadCount(count);
-            setLoading(false);
-        };
-        fetchUnread();
-    }, [friendRecord.id, friendRecord.last_read_user, friendRecord.last_read_friend, refreshKey]);
-
-    return (
-        <button onClick={() => selectChat(friendRecord)} className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/40'}`}>
-            <div className="relative">
-                <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">{(friendData?.name || 'U')[0].toUpperCase()}</div>
-                {unreadCount > 0 && (
-                    <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] bg-primary text-primary-foreground rounded-full flex items-center justify-center text-[8px] font-bold px-1">
-                        {unreadCount}
-                    </span>
-                )}
-            </div>
-            <div className="text-left truncate flex-1">
-                <div className="text-sm font-semibold truncate">{friendData?.name || friendData?.username || friendData?.email}</div>
-                {unreadCount > 0 ? (
-                    <p className="text-[10px] text-primary font-bold">{unreadCount} pesan baru</p>
-                ) : (
-                    <p className="text-[10px] text-emerald-500 font-bold flex items-center gap-1"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" /> Secured Session</p>
-                )}
-            </div>
-        </button>
-    );
-}
-
 export default function ChatPage() {
     const [myUser, setMyUser] = useState<any>(null);
     const [friends, setFriends] = useState<any[]>([]);
@@ -58,8 +21,7 @@ export default function ChatPage() {
     const [searchId, setSearchId] = useState("");
     const [showNoti, setShowNoti] = useState(false);
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-    const [totalUnread, setTotalUnread] = useState(0);
-    const [friendsKey, setFriendsKey] = useState(0); // Force re-render friends list
+    const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
     
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
@@ -92,18 +54,42 @@ export default function ChatPage() {
             setFriends(records.filter(r => r.status === 'accepted'));
             setRequests(records.filter(r => r.status === 'pending' && r.friend === userId));
             
-            // Hitung total unread
-            const acceptedFriends = records.filter(r => r.status === 'accepted');
-            let total = 0;
-            for (const f of acceptedFriends) {
-                const friendData = f.user === userId ? f.expand?.friend : f.expand?.user;
-                const count = await getUnreadCount(friendData?.id, f);
-                total += count;
-            }
-            setTotalUnread(total);
-            setFriendsKey(prev => prev + 1); // Force re-render
-            console.log('Total unread messages:', total);
+            // Load unread counts dari database
+            await loadUnreadCounts(records.filter(r => r.status === 'accepted'));
         } catch (err) { console.error(err); }
+    };
+
+    const loadUnreadCounts = async (friendRecords: any[]) => {
+        try {
+            const myId = pb.authStore.model?.id;
+            const newCounts: Record<string, number> = {};
+            
+            for (const f of friendRecords) {
+                const friendData = f.user === myId ? f.expand?.friend : f.expand?.user;
+                const isUserFirst = f.user === myId;
+                const lastRead = isUserFirst ? f.last_read_user : f.last_read_friend;
+                
+                if (friendData?.id) {
+                    // Hitung pesan yang belum dibaca
+                    const filter = lastRead 
+                        ? `sender="${friendData.id}" && receiver="${myId}" && created>"${lastRead}"`
+                        : `sender="${friendData.id}" && receiver="${myId}"`;
+                    
+                    const result = await pb.collection('messages').getList(1, 1, {
+                        filter,
+                        fields: 'id'
+                    });
+                    
+                    if (result.totalItems > 0) {
+                        newCounts[friendData.id] = result.totalItems;
+                    }
+                }
+            }
+            
+            setUnreadCounts(newCounts);
+        } catch (err) {
+            console.error('Error loading unread counts:', err);
+        }
     };
 
     const respondRequest = async (id: string, action: 'accepted' | 'reject') => {
@@ -130,31 +116,8 @@ export default function ChatPage() {
         }
     };
 
-    const getUnreadCount = async (friendId: string, friendRecord: any) => {
-        try {
-            const myId = pb.authStore.model?.id;
-            if (!myId) return 0;
-
-            // Tentukan siapa user dan siapa friend dalam record
-            const isUserFirst = friendRecord.user === myId;
-            const lastRead = isUserFirst ? friendRecord.last_read_user : friendRecord.last_read_friend;
-            
-            // Jika belum pernah dibaca, hitung semua pesan dari friend
-            const filter = lastRead 
-                ? `sender="${friendId}" && receiver="${myId}" && created>"${lastRead}"`
-                : `sender="${friendId}" && receiver="${myId}"`;
-            
-            const unreadMessages = await pb.collection('messages').getList(1, 1, {
-                filter,
-                fields: 'id'
-            });
-            
-            console.log(`Unread for ${friendId}:`, unreadMessages.totalItems, 'lastRead:', lastRead);
-            return unreadMessages.totalItems;
-        } catch (err) {
-            console.error('Error getting unread count:', err);
-            return 0;
-        }
+    const getTotalUnread = () => {
+        return Object.values(unreadCounts).reduce((sum, count) => sum + count, 0);
     };
 
     // --- REALTIME ENGINE ---
@@ -179,19 +142,19 @@ export default function ChatPage() {
                 const isFromMe = msg.sender === myId;
                 const isFromActive = activeChat && msg.sender === activeChat.id;
 
-                // Sync UI jika chat sedang dibuka - untuk pesan masuk ATAU keluar
-                if (activeChat) {
-                    const isChatWithActive = 
-                        (isFromActive && isForMe) || // Pesan masuk dari active chat
-                        (isFromMe && msg.receiver === activeChat.id); // Pesan keluar ke active chat
-                    
-                    if (isChatWithActive) {
-                        setMessages(prev => [...prev, msg]);
-                    }
+                // Sync UI jika chat sedang dibuka
+                if (isFromActive || isFromMe) {
+                    setMessages(prev => [...prev, msg]);
                 }
 
-                // Notifikasi jika pesan untuk saya dan bukan dari active chat
+                // Notifikasi jika tab sedang di-minimize atau sedang buka chat orang lain
                 if (isForMe && !isFromActive) {
+                    // Increment unread count di memory (untuk real-time UI)
+                    setUnreadCounts(prev => ({
+                        ...prev,
+                        [msg.sender]: (prev[msg.sender] || 0) + 1
+                    }));
+
                     // Get sender name for notification
                     try {
                         const sender = await pb.collection('users').getOne(msg.sender);
@@ -199,9 +162,6 @@ export default function ChatPage() {
                     } catch (err) {
                         triggerLocalNotification("Seseorang");
                     }
-                    
-                    // Reload friends untuk update unread counts
-                    loadFriends();
                 }
             }
         });
@@ -222,15 +182,21 @@ export default function ChatPage() {
         const key = generateChatKey(myUser.id, friendData.id, salt);
         currentChatKeyRef.current = key;
         
-        setActiveChat({ ...friendData, salt, friendRecordId: friendRecord.id });
+        setActiveChat({ ...friendData, salt });
         
-        // Update last_read di database
+        // Reset unread count untuk friend ini (di memory)
+        setUnreadCounts(prev => {
+            const newCounts = { ...prev };
+            delete newCounts[friendData.id];
+            return newCounts;
+        });
+        
+        // Update last_read di database untuk persistensi
         try {
             const isUserFirst = friendRecord.user === myUser.id;
             const updateData = isUserFirst 
                 ? { last_read_user: new Date().toISOString() }
                 : { last_read_friend: new Date().toISOString() };
-            
             await pb.collection('friends').update(friendRecord.id, updateData);
         } catch (err) {
             console.error('Error updating last_read:', err);
@@ -241,10 +207,6 @@ export default function ChatPage() {
             sort: 'created'
         });
         setMessages(res);
-        
-        // Reload friends untuk update unread counts
-        loadFriends();
-        
         if (window.innerWidth < 768) setIsSidebarOpen(false);
     };
 
@@ -282,9 +244,9 @@ export default function ChatPage() {
                     <h1 className="text-sm font-bold uppercase tracking-tighter">Bitlab Chat</h1>
                     <button onClick={() => setShowNoti(!showNoti)} className="relative p-2 hover:bg-accent rounded-md">
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>
-                        {(requests.length > 0 || totalUnread > 0) && (
+                        {(requests.length > 0 || getTotalUnread() > 0) && (
                             <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] bg-primary text-primary-foreground rounded-full flex items-center justify-center text-[9px] font-bold px-1">
-                                {requests.length + totalUnread}
+                                {requests.length + getTotalUnread()}
                             </span>
                         )}
                     </button>
@@ -319,16 +281,26 @@ export default function ChatPage() {
                     <p className="px-2 text-[10px] font-bold text-muted-foreground uppercase mb-2">Direct Messages</p>
                     {friends.map(f => {
                         const friendData = f.user === myUser.id ? f.expand?.friend : f.expand?.user;
+                        const unreadCount = unreadCounts[friendData?.id] || 0;
                         return (
-                            <FriendItem 
-                                key={`${f.id}-${friendsKey}`}
-                                friendRecord={f} 
-                                friendData={friendData} 
-                                activeChat={activeChat} 
-                                selectChat={selectChat}
-                                getUnreadCount={getUnreadCount}
-                                refreshKey={friendsKey}
-                            />
+                            <button key={f.id} onClick={() => selectChat(f)} className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/40'}`}>
+                                <div className="relative">
+                                    <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">{(friendData?.name || 'U')[0].toUpperCase()}</div>
+                                    {unreadCount > 0 && (
+                                        <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] bg-primary text-primary-foreground rounded-full flex items-center justify-center text-[8px] font-bold px-1">
+                                            {unreadCount}
+                                        </span>
+                                    )}
+                                </div>
+                                <div className="text-left truncate flex-1">
+                                    <div className="text-sm font-semibold truncate">{friendData?.name || friendData?.username || friendData?.email}</div>
+                                    {unreadCount > 0 ? (
+                                        <p className="text-[10px] text-primary font-bold">{unreadCount} pesan baru</p>
+                                    ) : (
+                                        <p className="text-[10px] text-emerald-500 font-bold flex items-center gap-1"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" /> Secured Session</p>
+                                    )}
+                                </div>
+                            </button>
                         );
                     })}
                 </div>

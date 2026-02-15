@@ -42,6 +42,13 @@ export default function ChatPage() {
         return CryptoJS.SHA256(combined + salt + INTERNAL_APP_KEY).toString();
     };
 
+    // --- NOTIFICATION HELPER ---
+    const triggerDesktopNotification = (title: string, body: string) => {
+        if (typeof window !== "undefined" && Notification.permission === "granted") {
+            new Notification(title, { body, icon: "/icon.png" });
+        }
+    };
+
     // --- LOGIC FUNCTIONS ---
     const loadFriends = async () => {
         try {
@@ -84,34 +91,45 @@ export default function ChatPage() {
         const input = searchId.trim();
         if (!input || input === myUser.id) return alert("ID tidak valid.");
         try {
-            const userList = await pb.collection('users').getList(1, 1, { 
-                filter: `id = "${input}" || email = "${input}"` 
-            });
+            const userList = await pb.collection('users').getList(1, 1, { filter: `id = "${input}" || email = "${input}"` });
             if (userList.items.length === 0) return alert("User tidak ditemukan.");
-            await pb.collection('friends').create({ 
-                user: myUser.id, friend: userList.items[0].id, status: 'pending' 
-            });
+            await pb.collection('friends').create({ user: myUser.id, friend: userList.items[0].id, status: 'pending' });
             alert("Permintaan terkirim!");
             setSearchId("");
         } catch (err) { alert("Gagal kirim permintaan."); }
     };
 
-    // --- REALTIME ---
+    // --- PERSISTENCE & REALTIME ---
     useEffect(() => {
         if (!pb.authStore.isValid) { window.location.href = "/login"; return; }
         setMyUser(pb.authStore.model);
         loadFriends();
+
+        // Load unread counts from LocalStorage (Anti-Refresh)
+        const savedUnread = localStorage.getItem('unread_counts');
+        if (savedUnread) setUnreadCounts(JSON.parse(savedUnread));
+
+        if ("Notification" in window && Notification.permission !== "granted") {
+            Notification.requestPermission();
+        }
 
         pb.collection('friends').subscribe('*', () => loadFriends());
         pb.collection('messages').subscribe('*', (e) => {
             if (e.action === 'create') {
                 const msg = e.record;
                 const myId = pb.authStore.model?.id;
+                
                 if (msg.sender === myId || (activeChat && msg.sender === activeChat.id)) {
                     setMessages(prev => [...prev, msg]);
                 }
+                
                 if (msg.receiver === myId && (!activeChat || msg.sender !== activeChat.id)) {
-                    setUnreadCounts(prev => ({ ...prev, [msg.sender]: (prev[msg.sender] || 0) + 1 }));
+                    setUnreadCounts(prev => {
+                        const newCounts = { ...prev, [msg.sender]: (prev[msg.sender] || 0) + 1 };
+                        localStorage.setItem('unread_counts', JSON.stringify(newCounts));
+                        return newCounts;
+                    });
+                    triggerDesktopNotification("Pesan Baru", "Seseorang mengirimkan pesan terenkripsi.");
                 }
             }
         });
@@ -129,7 +147,13 @@ export default function ChatPage() {
     const selectChat = async (friendRecord: any) => {
         const friendData = friendRecord.user === myUser.id ? friendRecord.expand.friend : friendRecord.expand.user;
         setActiveChat(friendData);
-        setUnreadCounts(prev => ({ ...prev, [friendData.id]: 0 }));
+        
+        setUnreadCounts(prev => {
+            const newCounts = { ...prev, [friendData.id]: 0 };
+            localStorage.setItem('unread_counts', JSON.stringify(newCounts));
+            return newCounts;
+        });
+
         const res = await pb.collection('messages').getFullList({
             filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
             sort: 'created'
@@ -152,10 +176,10 @@ export default function ChatPage() {
     if (!myUser) return <div className="h-screen flex items-center justify-center bg-background">Initializing...</div>;
 
     return (
-        <div className="flex h-screen bg-background text-foreground overflow-hidden border-t border-border font-sans">
+        <div className="flex h-screen bg-background text-foreground overflow-hidden border-t border-border">
             <aside className={`fixed md:relative inset-y-0 left-0 w-80 bg-card border-r border-border flex flex-col z-50 transition-transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
                 
-                {/* Header Sidebar + Notif Lonceng */}
+                {/* Header Sidebar + Lonceng */}
                 <div className="p-4 border-b border-border flex items-center justify-between relative">
                     <h1 className="text-sm font-bold uppercase tracking-tighter">Bitlab Chat</h1>
                     <button onClick={() => setShowNoti(!showNoti)} className="relative p-2 hover:bg-accent rounded-md transition-colors">
@@ -167,63 +191,84 @@ export default function ChatPage() {
                         )}
                     </button>
 
-                    {/* Pop-up Notifikasi Permintaan Teman */}
+                    {/* Pop-up Lonceng (DIPERJELAS) */}
                     {showNoti && (
-                        <div className="absolute top-14 right-4 w-64 bg-popover border border-border shadow-2xl rounded-lg z-[70] py-2 animate-in fade-in zoom-in-95 duration-200">
-                            <p className="px-4 py-1 text-[10px] font-bold text-muted-foreground uppercase">Friend Requests</p>
-                            <div className="max-h-48 overflow-y-auto">
-                                {requests.length === 0 ? <p className="px-4 py-3 text-xs text-muted-foreground">No pending requests</p> : 
-                                    requests.map(req => (
-                                        <div key={req.id} className="px-4 py-2 flex items-center justify-between border-b border-border last:border-0">
-                                            <span className="text-xs truncate font-medium">{req.expand?.user?.name || req.expand?.user?.email}</span>
-                                            <div className="flex gap-1">
-                                                <button onClick={() => respondRequest(req.id, 'accepted')} className="px-2 py-1 bg-primary text-white text-[10px] rounded hover:opacity-80">Accept</button>
-                                                <button onClick={() => respondRequest(req.id, 'reject')} className="px-2 py-1 bg-destructive text-white text-[10px] rounded hover:opacity-80">Reject</button>
+                        <div className="absolute top-14 right-4 w-72 bg-popover border border-border shadow-2xl rounded-lg z-[70] py-2 animate-in fade-in zoom-in-95">
+                            <div className="px-4 py-2 border-b border-border">
+                                <p className="text-[10px] font-bold text-muted-foreground uppercase">Notifications</p>
+                            </div>
+                            <div className="max-h-64 overflow-y-auto">
+                                {/* Permintaan Teman */}
+                                {requests.length > 0 && (
+                                    <div className="p-2">
+                                        <p className="px-2 text-[9px] font-bold text-primary mb-1">FRIEND REQUESTS</p>
+                                        {requests.map(req => (
+                                            <div key={req.id} className="px-2 py-2 flex items-center justify-between bg-muted/30 rounded-md mb-1">
+                                                <span className="text-[11px] truncate w-24 font-medium">{req.expand?.user?.name || req.expand?.user?.email}</span>
+                                                <div className="flex gap-1">
+                                                    <button onClick={() => respondRequest(req.id, 'accepted')} className="px-2 py-1 bg-primary text-white text-[9px] rounded">Accept</button>
+                                                    <button onClick={() => respondRequest(req.id, 'reject')} className="px-2 py-1 bg-destructive text-white text-[9px] rounded">Reject</button>
+                                                </div>
                                             </div>
-                                        </div>
-                                    ))
-                                }
+                                        ))}
+                                    </div>
+                                )}
+                                {/* Info Pesan Masuk */}
+                                {totalUnread > 0 ? (
+                                    <div className="p-2">
+                                        <p className="px-2 text-[9px] font-bold text-primary mb-1">UNREAD MESSAGES</p>
+                                        {friends.map(f => {
+                                            const fData = f.user === myUser.id ? f.expand?.friend : f.expand?.user;
+                                            if (!unreadCounts[fData.id]) return null;
+                                            return (
+                                                <div key={fData.id} className="px-2 py-2 text-xs border-b border-border last:border-0">
+                                                    Ada <span className="font-bold">{unreadCounts[fData.id]}</span> pesan baru dari <span className="font-bold">{fData.name}</span>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                ) : requests.length === 0 && <p className="px-4 py-6 text-center text-xs text-muted-foreground">Tidak ada notifikasi baru</p>}
                             </div>
                         </div>
                     )}
                 </div>
 
-                {/* Fitur Tambah Teman (BALIK LAGI) */}
-                <div className="p-4 border-b border-border">
+                {/* Tambah Teman */}
+                <div className="p-4 border-b border-border bg-muted/10">
                     <form onSubmit={addFriend} className="flex gap-2">
-                        <input value={searchId} onChange={(e) => setSearchId(e.target.value)} placeholder="User ID / Email" className="flex-1 h-9 bg-muted/50 border border-input rounded-md px-3 text-xs outline-none focus:ring-1 focus:ring-primary" />
+                        <input value={searchId} onChange={(e) => setSearchId(e.target.value)} placeholder="User ID / Email" className="flex-1 h-9 bg-background border border-input rounded-md px-3 text-xs outline-none focus:ring-1 focus:ring-primary" />
                         <button type="submit" className="h-9 px-3 bg-secondary text-secondary-foreground rounded-md text-[10px] font-bold hover:bg-secondary/80">ADD</button>
                     </form>
                 </div>
 
-                {/* List Teman + Notif Pesan Baru */}
+                {/* List Teman */}
                 <div className="flex-1 overflow-y-auto px-2 py-4 space-y-1">
-                    <p className="px-2 text-[10px] font-bold text-muted-foreground uppercase mb-2 tracking-widest">Direct Messages</p>
+                    <p className="px-2 text-[10px] font-bold text-muted-foreground uppercase mb-2 tracking-widest">Messages</p>
                     {friends.map(f => {
                         const friendData = f.user === myUser.id ? f.expand?.friend : f.expand?.user;
                         const unread = unreadCounts[friendData.id] || 0;
                         return (
-                            <button key={f.id} onClick={() => selectChat(f)} className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent shadow-sm' : 'hover:bg-accent/40'}`}>
+                            <button key={f.id} onClick={() => selectChat(f)} className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent' : 'hover:bg-accent/40'}`}>
                                 <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">{(friendData?.name || 'U')[0].toUpperCase()}</div>
                                 <div className="text-left flex-1 truncate">
                                     <div className="flex justify-between items-center">
                                         <span className="text-sm font-semibold truncate">{friendData?.name || friendData?.username}</span>
-                                        {unread > 0 && <span className="text-[9px] bg-primary px-1.5 py-0.5 rounded-full text-white font-black animate-bounce">{unread} PESAN BARU</span>}
+                                        {unread > 0 && <span className="text-[9px] bg-primary px-1.5 py-0.5 rounded-full text-white font-black animate-bounce">{unread} BARU</span>}
                                     </div>
-                                    <p className="text-[10px] text-emerald-500 font-bold flex items-center gap-1"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" /> Secured Session</p>
+                                    <p className="text-[10px] text-emerald-500 font-bold flex items-center gap-1"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" /> E2EE Secure</p>
                                 </div>
                             </button>
                         );
                     })}
                 </div>
 
-                {/* Info Akun Bawah (TETAP ADA) */}
+                {/* Sidebar Bawah (Info ID & Akun) */}
                 <div className="p-4 border-t border-border flex items-center justify-between bg-muted/20">
                     <div className="flex items-center gap-3 truncate">
                         <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-[10px] font-bold text-white shadow-lg">{(myUser.name || 'M')[0].toUpperCase()}</div>
                         <div className="truncate">
                             <p className="text-xs font-bold truncate leading-none">{myUser.name || myUser.username}</p>
-                            <p className="text-[9px] text-muted-foreground truncate mt-1 tracking-tighter">ID: {myUser.id}</p>
+                            <p className="text-[9px] text-muted-foreground truncate mt-1 tracking-tighter font-mono">ID: {myUser.id}</p>
                         </div>
                     </div>
                     <button onClick={() => { pb.authStore.clear(); window.location.href="/login"; }} className="p-2 hover:text-destructive transition-colors">
@@ -233,21 +278,15 @@ export default function ChatPage() {
             </aside>
 
             {/* Main Chat Area */}
-            <main className="flex-1 flex flex-col bg-background">
+            <main className="flex-1 flex flex-col bg-background relative">
                 {activeChat ? (
                     <>
                         <header className="h-14 border-b border-border flex items-center px-4 justify-between bg-background/80 backdrop-blur-md sticky top-0 z-10">
                             <div className="flex items-center gap-3">
-                                <button onClick={() => setIsSidebarOpen(true)} className="md:hidden p-2 hover:bg-accent rounded-md">
-                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
-                                </button>
-                                <div>
-                                    <h2 className="text-sm font-bold">{activeChat.name || activeChat.email}</h2>
-                                    <p className="text-[10px] text-emerald-500 font-black">E2EE ENCRYPTED</p>
-                                </div>
+                                <button onClick={() => setIsSidebarOpen(true)} className="md:hidden p-2 hover:bg-accent rounded-md"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" /></svg></button>
+                                <div><h2 className="text-sm font-bold">{activeChat.name || activeChat.email}</h2><p className="text-[10px] text-emerald-500 font-black">ENCRYPTED</p></div>
                             </div>
                         </header>
-                        
                         <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4">
                             {messages.map(msg => {
                                 let plainText = "";
@@ -256,10 +295,9 @@ export default function ChatPage() {
                                     const bytes = CryptoJS.AES.decrypt(msg.text, key);
                                     plainText = bytes.toString(CryptoJS.enc.Utf8);
                                 } catch (e) { plainText = ""; }
-                                
                                 const isMe = msg.sender === myUser.id;
                                 return (
-                                    <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-1 duration-300`}>
+                                    <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
                                         <div className={`max-w-[85%] md:max-w-[70%] px-4 py-2.5 rounded-2xl text-sm shadow-sm ${isMe ? 'bg-primary text-primary-foreground rounded-tr-none' : 'bg-card border border-border rounded-tl-none'}`}>
                                             <p className="break-words leading-relaxed">{plainText || "🔒 [Decryption Error]"}</p>
                                             <span className="text-[8px] mt-1 block opacity-50 text-right">{new Date(msg.created).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
@@ -268,23 +306,15 @@ export default function ChatPage() {
                                 );
                             })}
                         </div>
-
                         <div className="p-4 border-t border-border bg-background">
                             <form onSubmit={sendMessage} className="max-w-4xl mx-auto flex gap-3">
                                 <input value={inputText} onChange={(e) => setInputText(e.target.value)} placeholder="Type an encrypted message..." className="flex-1 h-11 bg-muted/30 border border-input rounded-full px-5 text-sm outline-none focus:ring-2 focus:ring-primary/20 transition-all" />
-                                <button type="submit" className="w-11 h-11 flex items-center justify-center bg-primary text-white rounded-full hover:scale-105 active:scale-95 transition-all shadow-lg">
-                                    <svg className="w-5 h-5 rotate-90" fill="currentColor" viewBox="0 0 20 20"><path d="M10.894 2.553a1 1 0 00-1.788 0l-7 14a1 1 0 001.169 1.409l5-1.429A1 1 0 009 15.571V11a1 1 0 112 0v4.571a1 1 0 00.725.962l5 1.428a1 1 0 001.17-1.408l-7-14z" /></svg>
-                                </button>
+                                <button type="submit" className="w-11 h-11 flex items-center justify-center bg-primary text-white rounded-full hover:scale-105 active:scale-95 transition-all shadow-lg"><svg className="w-5 h-5 rotate-90" fill="currentColor" viewBox="0 0 20 20"><path d="M10.894 2.553a1 1 0 00-1.788 0l-7 14a1 1 0 001.169 1.409l5-1.429A1 1 0 009 15.571V11a1 1 0 112 0v4.571a1 1 0 00.725.962l5 1.428a1 1 0 001.17-1.408l-7-14z" /></svg></button>
                             </form>
                         </div>
                     </>
                 ) : (
-                    <div className="flex-1 flex flex-col items-center justify-center opacity-20 space-y-4">
-                        <div className="w-16 h-16 border-2 border-dashed border-foreground rounded-full flex items-center justify-center">
-                            <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
-                        </div>
-                        <p className="text-[10px] font-bold uppercase tracking-[0.3em]">Select a session to chat</p>
-                    </div>
+                    <div className="flex-1 flex flex-col items-center justify-center opacity-20 space-y-4 font-bold uppercase tracking-widest text-[10px]">Select a session to chat</div>
                 )}
             </main>
         </div>

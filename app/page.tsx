@@ -53,7 +53,43 @@ export default function ChatPage() {
             });
             setFriends(records.filter(r => r.status === 'accepted'));
             setRequests(records.filter(r => r.status === 'pending' && r.friend === userId));
+            
+            // Load unread counts dari database
+            await loadUnreadCounts(records.filter(r => r.status === 'accepted'));
         } catch (err) { console.error(err); }
+    };
+
+    const loadUnreadCounts = async (friendRecords: any[]) => {
+        try {
+            const myId = pb.authStore.model?.id;
+            const newCounts: Record<string, number> = {};
+            
+            for (const f of friendRecords) {
+                const friendData = f.user === myId ? f.expand?.friend : f.expand?.user;
+                const isUserFirst = f.user === myId;
+                const lastRead = isUserFirst ? f.last_read_user : f.last_read_friend;
+                
+                if (friendData?.id) {
+                    // Hitung pesan yang belum dibaca
+                    const filter = lastRead 
+                        ? `sender="${friendData.id}" && receiver="${myId}" && created>"${lastRead}"`
+                        : `sender="${friendData.id}" && receiver="${myId}"`;
+                    
+                    const result = await pb.collection('messages').getList(1, 1, {
+                        filter,
+                        fields: 'id'
+                    });
+                    
+                    if (result.totalItems > 0) {
+                        newCounts[friendData.id] = result.totalItems;
+                    }
+                }
+            }
+            
+            setUnreadCounts(newCounts);
+        } catch (err) {
+            console.error('Error loading unread counts:', err);
+        }
     };
 
     const respondRequest = async (id: string, action: 'accepted' | 'reject') => {
@@ -113,7 +149,7 @@ export default function ChatPage() {
 
                 // Notifikasi jika tab sedang di-minimize atau sedang buka chat orang lain
                 if (isForMe && !isFromActive) {
-                    // Increment unread count
+                    // Increment unread count di memory (untuk real-time UI)
                     setUnreadCounts(prev => ({
                         ...prev,
                         [msg.sender]: (prev[msg.sender] || 0) + 1
@@ -148,12 +184,23 @@ export default function ChatPage() {
         
         setActiveChat({ ...friendData, salt });
         
-        // Reset unread count untuk friend ini
+        // Reset unread count untuk friend ini (di memory)
         setUnreadCounts(prev => {
             const newCounts = { ...prev };
             delete newCounts[friendData.id];
             return newCounts;
         });
+        
+        // Update last_read di database untuk persistensi
+        try {
+            const isUserFirst = friendRecord.user === myUser.id;
+            const updateData = isUserFirst 
+                ? { last_read_user: new Date().toISOString() }
+                : { last_read_friend: new Date().toISOString() };
+            await pb.collection('friends').update(friendRecord.id, updateData);
+        } catch (err) {
+            console.error('Error updating last_read:', err);
+        }
         
         const res = await pb.collection('messages').getFullList({
             filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,

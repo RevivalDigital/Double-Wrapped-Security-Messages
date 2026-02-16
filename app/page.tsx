@@ -14,11 +14,10 @@ const INTERNAL_APP_KEY = KEY1 + KEY2;
 // --- TYPE DEFINITIONS ---
 type MessageType = 'text' | 'image' | 'video' | 'audio' | 'file';
 
-interface EncryptedFileData {
+interface FileMetadata {
     filename: string;
     mimeType: string;
     size: number;
-    encryptedData: string;
 }
 
 // --- GCM HELPER FUNCTIONS ---
@@ -59,34 +58,18 @@ async function decryptGCM(base64Data: string, secretKey: string) {
     }
 }
 
-// --- FILE ENCRYPTION FUNCTIONS ---
-async function encryptFile(file: File, secretKey: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = async (e) => {
-            try {
-                const arrayBuffer = e.target?.result as ArrayBuffer;
-                const key = await getCryptoKey(secretKey);
-                const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                const encrypted = await window.crypto.subtle.encrypt(
-                    { name: "AES-GCM", iv },
-                    key,
-                    arrayBuffer
-                );
-                const combined = new Uint8Array(iv.length + encrypted.byteLength);
-                combined.set(iv);
-                combined.set(new Uint8Array(encrypted), iv.length);
-                resolve(btoa(String.fromCharCode(...combined)));
-            } catch (err) {
-                reject(err);
-            }
-        };
-        reader.onerror = reject;
-        reader.readAsArrayBuffer(file);
-    });
+// --- FILE ENCRYPTION FUNCTIONS (Simplified) ---
+async function encryptFileData(arrayBuffer: ArrayBuffer, secretKey: string): Promise<string> {
+    const key = await getCryptoKey(secretKey);
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, arrayBuffer);
+    const combined = new Uint8Array(iv.length + encrypted.byteLength);
+    combined.set(iv);
+    combined.set(new Uint8Array(encrypted), iv.length);
+    return btoa(String.fromCharCode(...combined));
 }
 
-async function decryptFile(base64Data: string, secretKey: string): Promise<ArrayBuffer> {
+async function decryptFileData(base64Data: string, secretKey: string): Promise<ArrayBuffer> {
     const key = await getCryptoKey(secretKey);
     const combined = new Uint8Array(atob(base64Data).split("").map(c => c.charCodeAt(0)));
     const iv = combined.slice(0, 12);
@@ -105,16 +88,14 @@ function DecryptedMessage({ text, secretKey }: { text: string; secretKey: string
 
 // --- SUB-COMPONENT UNTUK DISPLAY FILE ---
 function DecryptedFile({ 
-    encryptedData, 
+    message,
     secretKey, 
-    type 
 }: { 
-    encryptedData: string; 
+    message: any;
     secretKey: string; 
-    type: MessageType;
 }) {
     const [fileUrl, setFileUrl] = useState<string>("");
-    const [fileData, setFileData] = useState<EncryptedFileData | null>(null);
+    const [metadata, setMetadata] = useState<FileMetadata | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
 
@@ -126,14 +107,29 @@ function DecryptedFile({
                 setLoading(true);
                 setError(false);
                 
-                // Decrypt metadata
-                const decryptedMeta = await decryptGCM(encryptedData, secretKey);
-                const metadata: EncryptedFileData = JSON.parse(decryptedMeta);
-                setFileData(metadata);
+                // Decrypt metadata from text field
+                const decryptedMetaStr = await decryptGCM(message.text, secretKey);
+                const meta: FileMetadata = JSON.parse(decryptedMetaStr);
+                setMetadata(meta);
+                
+                // Get file attachment from PocketBase
+                if (!message.file) {
+                    throw new Error("No file attachment");
+                }
+                
+                // Fetch encrypted file
+                const fileUrl = pb.files.getUrl(message, message.file);
+                const response = await fetch(fileUrl);
+                const encryptedBlob = await response.blob();
+                const encryptedArrayBuffer = await encryptedBlob.arrayBuffer();
                 
                 // Decrypt file content
-                const decryptedBuffer = await decryptFile(metadata.encryptedData, secretKey);
-                const blob = new Blob([decryptedBuffer], { type: metadata.mimeType });
+                const decryptedBuffer = await decryptFileData(
+                    btoa(String.fromCharCode(...new Uint8Array(encryptedArrayBuffer))),
+                    secretKey
+                );
+                
+                const blob = new Blob([decryptedBuffer], { type: meta.mimeType });
                 objectUrl = URL.createObjectURL(blob);
                 setFileUrl(objectUrl);
                 setLoading(false);
@@ -149,7 +145,7 @@ function DecryptedFile({
         return () => {
             if (objectUrl) URL.revokeObjectURL(objectUrl);
         };
-    }, [encryptedData, secretKey]);
+    }, [message, secretKey]);
 
     if (loading) {
         return (
@@ -160,7 +156,7 @@ function DecryptedFile({
         );
     }
 
-    if (error || !fileData) {
+    if (error || !metadata) {
         return (
             <div className="p-3 bg-destructive/10 rounded-lg">
                 <p className="text-xs text-destructive">⚠️ Gagal mendekripsi file</p>
@@ -169,33 +165,33 @@ function DecryptedFile({
     }
 
     // Render berdasarkan tipe
-    if (type === 'image') {
+    if (message.type === 'image') {
         return (
             <div className="max-w-sm">
-                <img src={fileUrl} alt={fileData.filename} className="rounded-lg w-full h-auto" />
-                <p className="text-[8px] opacity-50 mt-1">{fileData.filename}</p>
+                <img src={fileUrl} alt={metadata.filename} className="rounded-lg w-full h-auto" />
+                <p className="text-[8px] opacity-50 mt-1">{metadata.filename}</p>
             </div>
         );
     }
 
-    if (type === 'video') {
+    if (message.type === 'video') {
         return (
             <div className="max-w-md">
                 <video controls className="rounded-lg w-full" src={fileUrl}>
                     Browser Anda tidak mendukung video.
                 </video>
-                <p className="text-[8px] opacity-50 mt-1">{fileData.filename}</p>
+                <p className="text-[8px] opacity-50 mt-1">{metadata.filename}</p>
             </div>
         );
     }
 
-    if (type === 'audio') {
+    if (message.type === 'audio') {
         return (
             <div className="min-w-[280px]">
                 <audio controls className="w-full" src={fileUrl}>
                     Browser Anda tidak mendukung audio.
                 </audio>
-                <p className="text-[8px] opacity-50 mt-1">{fileData.filename}</p>
+                <p className="text-[8px] opacity-50 mt-1">{metadata.filename}</p>
             </div>
         );
     }
@@ -204,7 +200,7 @@ function DecryptedFile({
     return (
         <a 
             href={fileUrl} 
-            download={fileData.filename}
+            download={metadata.filename}
             className="flex items-center gap-3 p-3 bg-muted/50 rounded-lg hover:bg-muted transition-colors"
         >
             <div className="w-10 h-10 bg-primary/20 rounded flex items-center justify-center">
@@ -213,8 +209,8 @@ function DecryptedFile({
                 </svg>
             </div>
             <div className="flex-1 min-w-0">
-                <p className="text-xs font-medium truncate">{fileData.filename}</p>
-                <p className="text-[10px] opacity-50">{(fileData.size / 1024).toFixed(1)} KB</p>
+                <p className="text-xs font-medium truncate">{metadata.filename}</p>
+                <p className="text-[10px] opacity-50">{(metadata.size / 1024).toFixed(1)} KB</p>
             </div>
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
@@ -534,7 +530,7 @@ export default function ChatPage() {
         }
     };
 
-    // --- FILE HANDLING ---
+    // --- FILE HANDLING (REVISED) ---
     const handleFileUpload = async (file: File, type: MessageType) => {
         if (!activeChat || !file) return;
         
@@ -547,32 +543,46 @@ export default function ChatPage() {
         try {
             setUploadingFile(true);
             
-            // Encrypt file
-            const encryptedFileData = await encryptFile(file, currentChatKeyRef.current);
+            // Read file as ArrayBuffer
+            const arrayBuffer = await file.arrayBuffer();
             
-            // Prepare metadata
-            const metadata: EncryptedFileData = {
+            // Encrypt file content
+            const encryptedFileData = await encryptFileData(arrayBuffer, currentChatKeyRef.current);
+            
+            // Convert encrypted data back to Blob for upload
+            const encryptedBytes = atob(encryptedFileData);
+            const encryptedArray = new Uint8Array(encryptedBytes.length);
+            for (let i = 0; i < encryptedBytes.length; i++) {
+                encryptedArray[i] = encryptedBytes.charCodeAt(i);
+            }
+            const encryptedBlob = new Blob([encryptedArray], { type: 'application/octet-stream' });
+            const encryptedFile = new File([encryptedBlob], `encrypted_${file.name}`, { type: 'application/octet-stream' });
+            
+            // Prepare metadata (NOT including file data, just info)
+            const metadata: FileMetadata = {
                 filename: file.name,
                 mimeType: file.type,
-                size: file.size,
-                encryptedData: encryptedFileData
+                size: file.size
             };
             
             // Encrypt metadata
             const encryptedMetadata = await encryptGCM(JSON.stringify(metadata), currentChatKeyRef.current);
             
-            // Send message
-            await pb.collection('messages').create({
-                sender: myUser.id,
-                receiver: activeChat.id,
-                text: encryptedMetadata,
-                type: type
-            });
+            // Create FormData
+            const formData = new FormData();
+            formData.append('sender', myUser.id);
+            formData.append('receiver', activeChat.id);
+            formData.append('text', encryptedMetadata);
+            formData.append('type', type);
+            formData.append('file', encryptedFile);
+            
+            // Send to PocketBase
+            await pb.collection('messages').create(formData);
             
             setShowAttachMenu(false);
         } catch (err) {
             console.error("File upload failed:", err);
-            alert("Gagal mengirim file");
+            alert("Gagal mengirim file: " + (err as Error).message);
         } finally {
             setUploadingFile(false);
         }
@@ -719,13 +729,12 @@ export default function ChatPage() {
                                 messages.map((m, idx) => (
                                     <div key={m.id || idx} className={`flex ${m.sender === myUser.id ? 'justify-end' : 'justify-start'}`}>
                                         <div className={`max-w-[75%] p-3 rounded-2xl text-sm ${m.sender === myUser.id ? 'bg-primary text-primary-foreground rounded-tr-none' : 'bg-muted rounded-tl-none'}`}>
-                                            {m.type === 'text' ? (
+                                            {(!m.type || m.type === 'text') ? (
                                                 <DecryptedMessage text={m.text} secretKey={currentChatKeyRef.current} />
                                             ) : (
                                                 <DecryptedFile 
-                                                    encryptedData={m.text} 
+                                                    message={m}
                                                     secretKey={currentChatKeyRef.current}
-                                                    type={m.type as MessageType}
                                                 />
                                             )}
                                             <p className="text-[8px] opacity-50 mt-1 text-right">{new Date(m.created).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</p>

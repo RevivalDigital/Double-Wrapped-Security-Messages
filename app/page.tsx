@@ -64,25 +64,6 @@ async function decryptGCM(base64Data: string, secretKey: string) {
     }
 }
 
-// --- FILE ENCRYPTION FUNCTIONS (Simplified) ---
-async function encryptFileData(arrayBuffer: ArrayBuffer, secretKey: string): Promise<string> {
-    const key = await getCryptoKey(secretKey);
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-    const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, arrayBuffer);
-    const combined = new Uint8Array(iv.length + encrypted.byteLength);
-    combined.set(iv);
-    combined.set(new Uint8Array(encrypted), iv.length);
-    return btoa(String.fromCharCode(...combined));
-}
-
-async function decryptFileData(base64Data: string, secretKey: string): Promise<ArrayBuffer> {
-    const key = await getCryptoKey(secretKey);
-    const combined = new Uint8Array(atob(base64Data).split("").map(c => c.charCodeAt(0)));
-    const iv = combined.slice(0, 12);
-    const data = combined.slice(12);
-    return await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
-}
-
 // --- SUB-COMPONENT UNTUK DISPLAY TEXT ---
 function DecryptedMessage({ text, secretKey }: { text: string; secretKey: string }) {
     const [decrypted, setDecrypted] = useState("...");
@@ -129,10 +110,16 @@ function DecryptedFile({
                 const encryptedBlob = await response.blob();
                 const encryptedArrayBuffer = await encryptedBlob.arrayBuffer();
                 
-                // Decrypt file content
-                const decryptedBuffer = await decryptFileData(
-                    btoa(String.fromCharCode(...new Uint8Array(encryptedArrayBuffer))),
-                    secretKey
+                // Decrypt file content (direct binary processing)
+                const encryptedArray = new Uint8Array(encryptedArrayBuffer);
+                const iv = encryptedArray.slice(0, 12);
+                const data = encryptedArray.slice(12);
+                
+                const key = await getCryptoKey(secretKey);
+                const decryptedBuffer = await window.crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv }, 
+                    key, 
+                    data
                 );
                 
                 const blob = new Blob([decryptedBuffer], { type: meta.mimeType });
@@ -683,24 +670,28 @@ export default function ChatPage() {
     const confirmSendFile = async () => {
         if (!filePreview || !activeChat) return;
         
+        const currentPreview = filePreview; // Store reference before clearing
+        
         try {
             setUploadingFile(true);
             setFilePreview(null); // Close preview
             
-            const { file, type } = filePreview;
+            const { file, type } = currentPreview;
             
             // Read file as ArrayBuffer
             const arrayBuffer = await file.arrayBuffer();
             
             // Encrypt file content
-            const encryptedFileData = await encryptFileData(arrayBuffer, currentChatKeyRef.current);
+            const key = await getCryptoKey(currentChatKeyRef.current);
+            const iv = window.crypto.getRandomValues(new Uint8Array(12));
+            const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, arrayBuffer);
             
-            // Convert encrypted data back to Blob for upload
-            const encryptedBytes = atob(encryptedFileData);
-            const encryptedArray = new Uint8Array(encryptedBytes.length);
-            for (let i = 0; i < encryptedBytes.length; i++) {
-                encryptedArray[i] = encryptedBytes.charCodeAt(i);
-            }
+            // Combine IV and encrypted data efficiently
+            const encryptedArray = new Uint8Array(iv.length + encrypted.byteLength);
+            encryptedArray.set(iv);
+            encryptedArray.set(new Uint8Array(encrypted), iv.length);
+            
+            // Create blob directly from array (no base64 conversion)
             const encryptedBlob = new Blob([encryptedArray], { type: 'application/octet-stream' });
             const encryptedFile = new File([encryptedBlob], `encrypted_${file.name}`, { type: 'application/octet-stream' });
             
@@ -732,8 +723,8 @@ export default function ChatPage() {
         } finally {
             setUploadingFile(false);
             // Cleanup preview URL
-            if (filePreview.previewUrl) {
-                URL.revokeObjectURL(filePreview.previewUrl);
+            if (currentPreview.previewUrl) {
+                URL.revokeObjectURL(currentPreview.previewUrl);
             }
         }
     };

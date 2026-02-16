@@ -1212,6 +1212,7 @@ export default function ChatPage() {
                 onSelectChat={selectChat}
                 onClearCache={handleClearCache}
                 respondRequest={respondRequest}
+                onRemoveFriend={removeFriend}
             />
 
             <main className="flex-1 flex flex-col bg-background">

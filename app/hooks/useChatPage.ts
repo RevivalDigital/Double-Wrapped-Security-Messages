@@ -602,6 +602,41 @@ export default function useChatPage() {
         }
     };
 
+    const removeFriend = async (friendRecordId: string) => {
+        const confirmDelete = window.confirm('Hapus pertemanan ini?');
+        if (!confirmDelete) return;
+
+        try {
+            const record = friends.find(f => f.id === friendRecordId);
+
+            await pb.collection('friends').delete(friendRecordId);
+
+            setFriends(prev => prev.filter(f => f.id !== friendRecordId));
+
+            if (record) {
+                const userId = pb.authStore.model?.id;
+                const friendData = record.user === userId ? record.expand?.friend : record.expand?.user;
+                if (friendData?.id) {
+                    setUnreadCounts(prev => {
+                        const updated = { ...prev };
+                        delete updated[friendData.id];
+                        return updated;
+                    });
+                }
+            }
+
+            if (activeChat?.friendRecordId === friendRecordId) {
+                setActiveChat(null);
+                setMessages([]);
+            }
+
+            alert('Pertemanan berhasil dihapus.');
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menghapus pertemanan.');
+        }
+    };
+
     const triggerLocalNotification = (name: string) => {
         if (Notification.permission === "granted") {
             new Notification("Pesan Baru", {
@@ -951,6 +986,7 @@ export default function useChatPage() {
         handleVoiceRecord,
         addFriend,
         handleClearCache,
-        respondRequest
+        respondRequest,
+        removeFriend
     };
 }

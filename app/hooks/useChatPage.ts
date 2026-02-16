@@ -841,7 +841,7 @@ export default function useChatPage() {
     const addFriend = async (e: React.FormEvent) => {
         e.preventDefault();
         const input = searchId.trim();
-        if (!input || input === myUser.id) {
+        if (!input) {
             alert("ID tidak valid.");
             return;
         }
@@ -856,9 +856,38 @@ export default function useChatPage() {
                 return;
             }
 
+            const targetUser = userList.items[0];
+
+            if (targetUser.id === myUser.id) {
+                alert("Tidak bisa menambahkan diri sendiri.");
+                return;
+            }
+
+            const existing = await pb.collection('friends').getFullList(1, {
+                filter: `(user = "${myUser.id}" && friend = "${targetUser.id}") || (user = "${targetUser.id}" && friend = "${myUser.id}")`
+            });
+
+            if (existing.length > 0) {
+                const relation = existing[0];
+
+                if (relation.status === 'accepted') {
+                    alert("Kalian sudah berteman.");
+                    return;
+                }
+
+                if (relation.status === 'pending') {
+                    if (relation.user === myUser.id) {
+                        alert("Permintaan sudah dikirim, menunggu konfirmasi.");
+                    } else {
+                        alert("Pengguna ini sudah mengirim permintaan, cek permintaan pertemanan.");
+                    }
+                    return;
+                }
+            }
+
             await pb.collection('friends').create({
                 user: myUser.id,
-                friend: userList.items[0].id,
+                friend: targetUser.id,
                 status: 'pending'
             });
 

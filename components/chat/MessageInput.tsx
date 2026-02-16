@@ -11,9 +11,9 @@ interface MessageInputProps {
     sendMessage: (e: React.FormEvent) => void | Promise<void>;
     handleFileSelect: (file: File, type: MessageType) => void;
     handleVoiceRecord: (blob: Blob) => void;
-    fileInputRef: RefObject<HTMLInputElement>;
-    imageInputRef: RefObject<HTMLInputElement>;
-    videoInputRef: RefObject<HTMLInputElement>;
+    fileInputRef: RefObject<HTMLInputElement | null>;
+    imageInputRef: RefObject<HTMLInputElement | null>;
+    videoInputRef: RefObject<HTMLInputElement | null>;
 }
 
 function VoiceRecorder({ onRecord }: { onRecord: (blob: Blob) => void }) {
@@ -157,4 +157,3 @@ export default function MessageInput({
         </form>
     );
 }
-

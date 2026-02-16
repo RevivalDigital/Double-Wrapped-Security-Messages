@@ -192,7 +192,7 @@ function KeyRestoreModal({
         </div>
     );
 }
-
+/*
 function DecryptedMessage({ text, sharedSecret }: { text: string; sharedSecret: CryptoKey | null }) {
     const [decrypted, setDecrypted] = useState("...");
 
@@ -346,7 +346,7 @@ function DecryptedFile({
         </a>
     );
 }
-
+*/
 function FilePreviewModal({ 
     preview, 
     onSend, 
@@ -432,6 +432,7 @@ function FilePreviewModal({
     );
 }
 
+/*
 function VoiceRecorder({ onRecord }: { onRecord: (blob: Blob) => void }) {
     const [isRecording, setIsRecording] = useState(false);
     const [duration, setDuration] = useState(0);
@@ -1078,6 +1079,7 @@ function useChatPage() {
         respondRequest
     };
 }
+*/
 
 // ==================== MAIN CHAT COMPONENT ====================
 export default function ChatPage() {

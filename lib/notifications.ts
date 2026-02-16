@@ -3,6 +3,7 @@
 
 type ExtendedNotificationOptions = NotificationOptions & {
     vibrate?: number[];
+    renotify?: boolean;
 };
 
 export class NotificationManager {
@@ -61,7 +62,7 @@ export class NotificationManager {
     }
 
     // Show notification
-    show(title: string, options?: NotificationOptions): Notification | null {
+    show(title: string, options?: ExtendedNotificationOptions): Notification | null {
         if (!this.permissionGranted) {
             console.warn('Notification permission not granted');
             return null;

@@ -1,395 +1,12 @@
 "use client";
 
-import { useEffect, useState, useRef } from 'react';
-import PocketBase from 'pocketbase';
-
-const PB_URL = process.env.NEXT_PUBLIC_PB_URL || "";
-const pb = new PocketBase(PB_URL);
-
-// --- TYPE DEFINITIONS ---
-type MessageType = 'text' | 'image' | 'video' | 'audio' | 'file';
-
-interface FileMetadata {
-    filename: string;
-    mimeType: string;
-    size: number;
-}
-
-interface FilePreview {
-    file: File;
-    type: MessageType;
-    previewUrl?: string;
-}
-
-interface StoredKeyPair {
-    publicKey: JsonWebKey;
-    privateKey: JsonWebKey;
-    userId: string;
-    timestamp: number;
-}
-
-// ==================== INDEXEDDB MANAGER ====================
-class SecureIndexedDB {
-    private dbName = 'BitlabSecureChat';
-    private version = 1;
-    private db: IDBDatabase | null = null;
-
-    async init(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const request = indexedDB.open(this.dbName, this.version);
-
-            request.onerror = () => reject(request.error);
-            request.onsuccess = () => {
-                this.db = request.result;
-                resolve();
-            };
-
-            request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
-                const db = (event.target as IDBOpenDBRequest).result;
-
-                // Store for ECDH key pairs
-                if (!db.objectStoreNames.contains('keyPairs')) {
-                    db.createObjectStore('keyPairs', { keyPath: 'userId' });
-                }
-
-                // Store for cached messages
-                if (!db.objectStoreNames.contains('messages')) {
-                    const msgStore = db.createObjectStore('messages', { keyPath: 'cacheKey' });
-                    msgStore.createIndex('userId', 'userId', { unique: false });
-                    msgStore.createIndex('timestamp', 'timestamp', { unique: false });
-                }
-
-                // Store for shared secrets cache
-                if (!db.objectStoreNames.contains('sharedSecrets')) {
-                    db.createObjectStore('sharedSecrets', { keyPath: 'id' });
-                }
-            };
-        });
-    }
-
-    async saveKeyPair(userId: string, publicKey: JsonWebKey, privateKey: JsonWebKey): Promise<void> {
-        if (!this.db) throw new Error('Database not initialized');
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['keyPairs'], 'readwrite');
-            const store = tx.objectStore('keyPairs');
-            const data: StoredKeyPair = { userId, publicKey, privateKey, timestamp: Date.now() };
-            
-            const request = store.put(data);
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error);
-        });
-    }
-
-    async getKeyPair(userId: string): Promise<StoredKeyPair | null> {
-        if (!this.db) throw new Error('Database not initialized');
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['keyPairs'], 'readonly');
-            const store = tx.objectStore('keyPairs');
-            const request = store.get(userId);
-
-            request.onsuccess = () => resolve(request.result || null);
-            request.onerror = () => reject(request.error);
-        });
-    }
-
-    async saveMessages(userId: string, friendId: string, messages: any[]): Promise<void> {
-        if (!this.db) throw new Error('Database not initialized');
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['messages'], 'readwrite');
-            const store = tx.objectStore('messages');
-            const cacheKey = `${userId}_${friendId}`;
-            
-            const request = store.put({
-                cacheKey,
-                userId,
-                friendId,
-                messages,
-                timestamp: Date.now()
-            });
-
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error);
-        });
-    }
-
-    async getMessages(userId: string, friendId: string): Promise<any[] | null> {
-        if (!this.db) throw new Error('Database not initialized');
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['messages'], 'readonly');
-            const store = tx.objectStore('messages');
-            const cacheKey = `${userId}_${friendId}`;
-            const request = store.get(cacheKey);
-
-            request.onsuccess = () => {
-                const data = request.result;
-                if (!data) return resolve(null);
-                
-                // Expire after 7 days
-                if (Date.now() - data.timestamp > 7 * 24 * 60 * 60 * 1000) {
-                    this.deleteMessages(userId, friendId);
-                    return resolve(null);
-                }
-                
-                resolve(data.messages);
-            };
-            request.onerror = () => reject(request.error);
-        });
-    }
-
-    async deleteMessages(userId: string, friendId: string): Promise<void> {
-        if (!this.db) throw new Error('Database not initialized');
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['messages'], 'readwrite');
-            const store = tx.objectStore('messages');
-            const cacheKey = `${userId}_${friendId}`;
-            const request = store.delete(cacheKey);
-
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error);
-        });
-    }
-
-    async clearAllMessages(userId: string): Promise<void> {
-        if (!this.db) throw new Error('Database not initialized');
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['messages'], 'readwrite');
-            const store = tx.objectStore('messages');
-            const index = store.index('userId');
-            const request = index.openCursor(IDBKeyRange.only(userId));
-
-            request.onsuccess = (event) => {
-                const cursor = (event.target as IDBRequest).result;
-                if (cursor) {
-                    cursor.delete();
-                    cursor.continue();
-                } else {
-                    resolve();
-                }
-            };
-            request.onerror = () => reject(request.error);
-        });
-    }
-
-    async saveSharedSecret(id: string, secret: string): Promise<void> {
-        if (!this.db) throw new Error('Database not initialized');
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['sharedSecrets'], 'readwrite');
-            const store = tx.objectStore('sharedSecrets');
-            const request = store.put({ id, secret, timestamp: Date.now() });
-
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error);
-        });
-    }
-
-    async getSharedSecret(id: string): Promise<string | null> {
-        if (!this.db) throw new Error('Database not initialized');
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['sharedSecrets'], 'readonly');
-            const store = tx.objectStore('sharedSecrets');
-            const request = store.get(id);
-
-            request.onsuccess = () => {
-                const data = request.result;
-                resolve(data ? data.secret : null);
-            };
-            request.onerror = () => reject(request.error);
-        });
-    }
-}
-
-const secureDB = new SecureIndexedDB();
-
-// ==================== ECDH CRYPTO FUNCTIONS ====================
-class ECDHCrypto {
-    // Generate ECDH key pair
-    static async generateKeyPair(): Promise<CryptoKeyPair> {
-        return window.crypto.subtle.generateKey(
-            {
-                name: "ECDH",
-                namedCurve: "P-256"
-            },
-            true,
-            ["deriveKey", "deriveBits"]
-        );
-    }
-
-    // Export public key to JWK format
-    static async exportPublicKey(publicKey: CryptoKey): Promise<JsonWebKey> {
-        return window.crypto.subtle.exportKey("jwk", publicKey);
-    }
-
-    // Export private key to JWK format
-    static async exportPrivateKey(privateKey: CryptoKey): Promise<JsonWebKey> {
-        return window.crypto.subtle.exportKey("jwk", privateKey);
-    }
-
-    // Import public key from JWK
-    static async importPublicKey(jwk: JsonWebKey): Promise<CryptoKey> {
-        return window.crypto.subtle.importKey(
-            "jwk",
-            jwk,
-            { name: "ECDH", namedCurve: "P-256" },
-            true,
-            []
-        );
-    }
-
-    // Import private key from JWK
-    static async importPrivateKey(jwk: JsonWebKey): Promise<CryptoKey> {
-        return window.crypto.subtle.importKey(
-            "jwk",
-            jwk,
-            { name: "ECDH", namedCurve: "P-256" },
-            true,
-            ["deriveKey", "deriveBits"]
-        );
-    }
-
-    // Derive shared secret between two parties
-    static async deriveSharedSecret(privateKey: CryptoKey, publicKey: CryptoKey): Promise<CryptoKey> {
-        return window.crypto.subtle.deriveKey(
-            { name: "ECDH", public: publicKey },
-            privateKey,
-            { name: "AES-GCM", length: 256 },
-            true,
-            ["encrypt", "decrypt"]
-        );
-    }
-
-    // Encrypt private key with passphrase for backup
-    static async encryptPrivateKeyWithPassphrase(privateKeyJwk: JsonWebKey, passphrase: string): Promise<string> {
-        const encoder = new TextEncoder();
-        const passphraseData = encoder.encode(passphrase);
-        
-        // Derive key from passphrase
-        const passphraseKey = await window.crypto.subtle.importKey(
-            "raw",
-            passphraseData,
-            "PBKDF2",
-            false,
-            ["deriveBits", "deriveKey"]
-        );
-
-        const salt = window.crypto.getRandomValues(new Uint8Array(16));
-        const derivedKey = await window.crypto.subtle.deriveKey(
-            {
-                name: "PBKDF2",
-                salt: salt,
-                iterations: 100000,
-                hash: "SHA-256"
-            },
-            passphraseKey,
-            { name: "AES-GCM", length: 256 },
-            true,
-            ["encrypt", "decrypt"]
-        );
-
-        // Encrypt private key
-        const iv = window.crypto.getRandomValues(new Uint8Array(12));
-        const privateKeyString = JSON.stringify(privateKeyJwk);
-        const encrypted = await window.crypto.subtle.encrypt(
-            { name: "AES-GCM", iv },
-            derivedKey,
-            encoder.encode(privateKeyString)
-        );
-
-        // Combine salt + iv + encrypted data
-        const combined = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
-        combined.set(salt, 0);
-        combined.set(iv, salt.length);
-        combined.set(new Uint8Array(encrypted), salt.length + iv.length);
-
-        return btoa(String.fromCharCode(...combined));
-    }
-
-    // Decrypt private key with passphrase
-    static async decryptPrivateKeyWithPassphrase(encryptedData: string, passphrase: string): Promise<JsonWebKey> {
-        const encoder = new TextEncoder();
-        const decoder = new TextDecoder();
-        const passphraseData = encoder.encode(passphrase);
-
-        // Decode combined data
-        const combined = new Uint8Array(atob(encryptedData).split("").map(c => c.charCodeAt(0)));
-        const salt = combined.slice(0, 16);
-        const iv = combined.slice(16, 28);
-        const encrypted = combined.slice(28);
-
-        // Derive key from passphrase
-        const passphraseKey = await window.crypto.subtle.importKey(
-            "raw",
-            passphraseData,
-            "PBKDF2",
-            false,
-            ["deriveBits", "deriveKey"]
-        );
-
-        const derivedKey = await window.crypto.subtle.deriveKey(
-            {
-                name: "PBKDF2",
-                salt: salt,
-                iterations: 100000,
-                hash: "SHA-256"
-            },
-            passphraseKey,
-            { name: "AES-GCM", length: 256 },
-            true,
-            ["encrypt", "decrypt"]
-        );
-
-        // Decrypt private key
-        const decrypted = await window.crypto.subtle.decrypt(
-            { name: "AES-GCM", iv },
-            derivedKey,
-            encrypted
-        );
-
-        const privateKeyString = decoder.decode(decrypted);
-        return JSON.parse(privateKeyString);
-    }
-
-    // Encrypt text with AES-GCM
-    static async encryptMessage(text: string, sharedSecret: CryptoKey): Promise<string> {
-        const encoder = new TextEncoder();
-        const iv = window.crypto.getRandomValues(new Uint8Array(12));
-        
-        const encrypted = await window.crypto.subtle.encrypt(
-            { name: "AES-GCM", iv },
-            sharedSecret,
-            encoder.encode(text)
-        );
-
-        const combined = new Uint8Array(iv.length + encrypted.byteLength);
-        combined.set(iv);
-        combined.set(new Uint8Array(encrypted), iv.length);
-
-        return btoa(String.fromCharCode(...combined));
-    }
-
-    // Decrypt text with AES-GCM
-    static async decryptMessage(encryptedData: string, sharedSecret: CryptoKey): Promise<string> {
-        const decoder = new TextDecoder();
-        const combined = new Uint8Array(atob(encryptedData).split("").map(c => c.charCodeAt(0)));
-        const iv = combined.slice(0, 12);
-        const data = combined.slice(12);
-
-        const decrypted = await window.crypto.subtle.decrypt(
-            { name: "AES-GCM", iv },
-            sharedSecret,
-            data
-        );
-
-        return decoder.decode(decrypted);
-    }
-}
+import { useEffect, useRef, useState } from 'react';
+import useChatPageHook, { ECDHCrypto, FileMetadata, FilePreview, pb } from './hooks/useChatPage';
+import { NotificationPermissionBanner } from '../components/NotificationPermissionBanner';
+import Sidebar from '../components/layout/Sidebar';
+import ChatHeader from '../components/layout/ChatHeader';
+import EmptyState from '../components/layout/EmptyState';
+import ChatContainer from '../components/chat/ChatContainer';
 
 // ==================== KEY BACKUP MODAL ====================
 function KeyBackupModal({ 
@@ -576,7 +193,6 @@ function KeyRestoreModal({
     );
 }
 
-// ==================== DECRYPTED MESSAGE COMPONENT ====================
 function DecryptedMessage({ text, sharedSecret }: { text: string; sharedSecret: CryptoKey | null }) {
     const [decrypted, setDecrypted] = useState("...");
 
@@ -594,7 +210,6 @@ function DecryptedMessage({ text, sharedSecret }: { text: string; sharedSecret: 
     return <p className="whitespace-pre-wrap break-words">{decrypted}</p>;
 }
 
-// ==================== DECRYPTED FILE COMPONENT ====================
 function DecryptedFile({ 
     message,
     sharedSecret, 
@@ -732,7 +347,6 @@ function DecryptedFile({
     );
 }
 
-// ==================== FILE PREVIEW MODAL ====================
 function FilePreviewModal({ 
     preview, 
     onSend, 
@@ -818,7 +432,6 @@ function FilePreviewModal({
     );
 }
 
-// ==================== VOICE RECORDER ====================
 function VoiceRecorder({ onRecord }: { onRecord: (blob: Blob) => void }) {
     const [isRecording, setIsRecording] = useState(false);
     const [duration, setDuration] = useState(0);
@@ -905,8 +518,8 @@ function VoiceRecorder({ onRecord }: { onRecord: (blob: Blob) => void }) {
     );
 }
 
-// ==================== MAIN CHAT COMPONENT ====================
-export default function ChatPage() {
+// ==================== MAIN CHAT HOOK ====================
+function useChatPage() {
     const [myUser, setMyUser] = useState<any>(null);
     const [friends, setFriends] = useState<any[]>([]);
     const [requests, setRequests] = useState<any[]>([]);
@@ -922,26 +535,23 @@ export default function ChatPage() {
     const [uploadingFile, setUploadingFile] = useState(false);
     const [showAttachMenu, setShowAttachMenu] = useState(false);
     const [filePreview, setFilePreview] = useState<FilePreview | null>(null);
-    
-    // ECDH state
     const [showBackupModal, setShowBackupModal] = useState(false);
     const [showRestoreModal, setShowRestoreModal] = useState(false);
     const [myKeyPair, setMyKeyPair] = useState<CryptoKeyPair | null>(null);
     const [sharedSecrets, setSharedSecrets] = useState<Map<string, CryptoKey>>(new Map());
     const [initializingKeys, setInitializingKeys] = useState(true);
-    
+
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentSharedSecretRef = useRef<CryptoKey | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
     const videoInputRef = useRef<HTMLInputElement>(null);
 
-    // Initialize IndexedDB and check for existing keys
     useEffect(() => {
         const initApp = async () => {
             try {
                 await secureDB.init();
-                
+
                 if (!pb.authStore.isValid) {
                     window.location.href = "/login";
                     return;
@@ -952,28 +562,23 @@ export default function ChatPage() {
                     window.location.href = "/login";
                     return;
                 }
-                
+
                 setMyUser(user);
 
-                // Check if user has existing key pair in IndexedDB
                 const storedKeyPair = await secureDB.getKeyPair(user.id);
-                
+
                 if (storedKeyPair) {
-                    // Import existing keys
                     const publicKey = await ECDHCrypto.importPublicKey(storedKeyPair.publicKey);
                     const privateKey = await ECDHCrypto.importPrivateKey(storedKeyPair.privateKey);
                     setMyKeyPair({ publicKey, privateKey });
                     setInitializingKeys(false);
                 } else {
-                    // Check if backup exists on server
                     try {
                         const userRecord = await pb.collection('users').getOne(user.id);
                         if (userRecord.encrypted_private_key) {
-                            // Has backup, show restore modal
                             setShowRestoreModal(true);
                             setInitializingKeys(false);
                         } else {
-                            // No keys at all, show setup modal
                             setShowBackupModal(true);
                             setInitializingKeys(false);
                         }
@@ -997,31 +602,25 @@ export default function ChatPage() {
         initApp();
     }, []);
 
-    // Setup new backup
     const handleSetupBackup = async (passphrase: string) => {
         try {
-            // Generate new ECDH key pair
             const keyPair = await ECDHCrypto.generateKeyPair();
-            
-            // Export keys
+
             const publicKeyJwk = await ECDHCrypto.exportPublicKey(keyPair.publicKey);
             const privateKeyJwk = await ECDHCrypto.exportPrivateKey(keyPair.privateKey);
-            
-            // Encrypt private key with passphrase
+
             const encryptedPrivateKey = await ECDHCrypto.encryptPrivateKeyWithPassphrase(
                 privateKeyJwk,
                 passphrase
             );
-            
-            // Save to IndexedDB
+
             await secureDB.saveKeyPair(myUser.id, publicKeyJwk, privateKeyJwk);
-            
-            // Upload to PocketBase
+
             await pb.collection('users').update(myUser.id, {
                 public_key: JSON.stringify(publicKeyJwk),
                 encrypted_private_key: encryptedPrivateKey
             });
-            
+
             setMyKeyPair(keyPair);
             setShowBackupModal(false);
             alert("✅ Backup berhasil dibuat!");
@@ -1031,16 +630,13 @@ export default function ChatPage() {
         }
     };
 
-    // Restore from backup
     const handleRestoreBackup = async (passphrase: string): Promise<boolean> => {
         try {
-            // Fetch encrypted key from server
             const userRecord = await pb.collection('users').getOne(myUser.id);
             if (!userRecord.encrypted_private_key || !userRecord.public_key) {
                 return false;
             }
 
-            // Decrypt private key
             const privateKeyJwk = await ECDHCrypto.decryptPrivateKeyWithPassphrase(
                 userRecord.encrypted_private_key,
                 passphrase
@@ -1048,11 +644,9 @@ export default function ChatPage() {
 
             const publicKeyJwk = JSON.parse(userRecord.public_key);
 
-            // Import keys
             const publicKey = await ECDHCrypto.importPublicKey(publicKeyJwk);
             const privateKey = await ECDHCrypto.importPrivateKey(privateKeyJwk);
 
-            // Save to IndexedDB
             await secureDB.saveKeyPair(myUser.id, publicKeyJwk, privateKeyJwk);
 
             setMyKeyPair({ publicKey, privateKey });
@@ -1065,22 +659,18 @@ export default function ChatPage() {
         }
     };
 
-    // Skip restore and create new keys
     const handleSkipRestore = async () => {
         setShowRestoreModal(false);
         setShowBackupModal(true);
     };
 
-    // Derive shared secret with friend
     const deriveSharedSecretWithFriend = async (friendId: string): Promise<CryptoKey | null> => {
         try {
             if (!myKeyPair) return null;
 
-            // Check cache first
             const cacheId = [myUser.id, friendId].sort().join('_');
             const cached = await secureDB.getSharedSecret(cacheId);
             if (cached) {
-                // Import cached key
                 const keyData = JSON.parse(cached);
                 return window.crypto.subtle.importKey(
                     "jwk",
@@ -1091,7 +681,6 @@ export default function ChatPage() {
                 );
             }
 
-            // Fetch friend's public key
             const friendRecord = await pb.collection('users').getOne(friendId);
             if (!friendRecord.public_key) {
                 console.error("Friend doesn't have public key");
@@ -1101,13 +690,11 @@ export default function ChatPage() {
             const friendPublicKeyJwk = JSON.parse(friendRecord.public_key);
             const friendPublicKey = await ECDHCrypto.importPublicKey(friendPublicKeyJwk);
 
-            // Derive shared secret
             const sharedSecret = await ECDHCrypto.deriveSharedSecret(
                 myKeyPair.privateKey,
                 friendPublicKey
             );
 
-            // Cache the shared secret
             const exportedSecret = await window.crypto.subtle.exportKey("jwk", sharedSecret);
             await secureDB.saveSharedSecret(cacheId, JSON.stringify(exportedSecret));
 
@@ -1118,7 +705,6 @@ export default function ChatPage() {
         }
     };
 
-    // Load friends
     const loadFriends = async () => {
         try {
             const userId = pb.authStore.model?.id;
@@ -1143,8 +729,8 @@ export default function ChatPage() {
                 const friendData = f.user === myId ? f.expand?.friend : f.expand?.user;
                 const lastRead = f.user === myId ? f.last_read_user : f.last_read_friend;
                 if (friendData?.id) {
-                    const filter = lastRead 
-                        ? `sender="${friendData.id}" && receiver="${myId}" && created>"${lastRead}"` 
+                    const filter = lastRead
+                        ? `sender="${friendData.id}" && receiver="${myId}" && created>"${lastRead}"`
                         : `sender="${friendData.id}" && receiver="${myId}"`;
                     const result = await pb.collection('messages').getList(1, 1, { filter, fields: 'id' });
                     if (result.totalItems > 0) newCounts[friendData.id] = result.totalItems;
@@ -1171,14 +757,13 @@ export default function ChatPage() {
 
     const triggerLocalNotification = (name: string) => {
         if (Notification.permission === "granted") {
-            new Notification("Pesan Baru", { 
-                body: `Pesan dari ${name}`, 
-                icon: "/icon.png" 
+            new Notification("Pesan Baru", {
+                body: `Pesan dari ${name}`,
+                icon: "/icon.png"
             });
         }
     };
 
-    // Realtime subscriptions
     useEffect(() => {
         if (!myUser) return;
 
@@ -1203,11 +788,11 @@ export default function ChatPage() {
                 }
 
                 if (msg.receiver === myId && (!activeChat || msg.sender !== activeChat.id)) {
-                    setUnreadCounts(prev => ({ 
-                        ...prev, 
-                        [msg.sender]: (prev[msg.sender] || 0) + 1 
+                    setUnreadCounts(prev => ({
+                        ...prev,
+                        [msg.sender]: (prev[msg.sender] || 0) + 1
                     }));
-                    
+
                     try {
                         const sender = await pb.collection('users').getOne(msg.sender);
                         triggerLocalNotification(sender.name || sender.username || "Seseorang");
@@ -1224,14 +809,12 @@ export default function ChatPage() {
         };
     }, [activeChat, myUser]);
 
-    // Auto-scroll chat
     useEffect(() => {
         if (chatBoxRef.current) {
             chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
         }
     }, [messages]);
 
-    // Select chat
     const selectChat = async (friendRecord: any) => {
         if (!myUser?.id || !myKeyPair) return;
 
@@ -1239,11 +822,10 @@ export default function ChatPage() {
         setLoadingMessages(true);
         setLoadError(null);
 
-        const friendData = friendRecord.user === myUser.id 
-            ? friendRecord.expand.friend 
+        const friendData = friendRecord.user === myUser.id
+            ? friendRecord.expand.friend
             : friendRecord.expand.user;
 
-        // Derive shared secret
         const sharedSecret = await deriveSharedSecretWithFriend(friendData.id);
         if (!sharedSecret) {
             setLoadError("Gagal membuat kunci enkripsi dengan teman");
@@ -1261,7 +843,6 @@ export default function ChatPage() {
             return n;
         });
 
-        // Mark as read
         try {
             const isUserFirst = friendRecord.user === myUser.id;
             await pb.collection('friends').update(friendRecord.id, {
@@ -1271,14 +852,12 @@ export default function ChatPage() {
             console.error(err);
         }
 
-        // Load from cache first
         const cached = await secureDB.getMessages(myUser.id, friendData.id);
         if (cached) {
             setMessages(cached);
             setLoadingMessages(false);
         }
 
-        // Fetch fresh messages
         try {
             const res = await pb.collection('messages').getList(1, 50, {
                 filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
@@ -1299,7 +878,6 @@ export default function ChatPage() {
         if (window.innerWidth < 768) setIsSidebarOpen(false);
     };
 
-    // Send message
     const sendMessage = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!inputText.trim() || !activeChat || !currentSharedSecretRef.current) return;
@@ -1324,7 +902,6 @@ export default function ChatPage() {
         }
     };
 
-    // File handling
     const handleFileSelect = (file: File, type: MessageType) => {
         if (!file) return;
 
@@ -1353,7 +930,6 @@ export default function ChatPage() {
             const { file, type } = currentPreview;
             const arrayBuffer = await file.arrayBuffer();
 
-            // Encrypt file
             const iv = window.crypto.getRandomValues(new Uint8Array(12));
             const encrypted = await window.crypto.subtle.encrypt(
                 { name: "AES-GCM", iv },
@@ -1372,7 +948,6 @@ export default function ChatPage() {
                 { type: 'application/octet-stream' }
             );
 
-            // Encrypt metadata
             const metadata: FileMetadata = {
                 filename: file.name,
                 mimeType: file.type,
@@ -1384,7 +959,6 @@ export default function ChatPage() {
                 currentSharedSecretRef.current
             );
 
-            // Send to PocketBase
             const formData = new FormData();
             formData.append('sender', myUser.id);
             formData.append('receiver', activeChat.id);
@@ -1417,7 +991,6 @@ export default function ChatPage() {
         handleFileSelect(file, 'audio');
     };
 
-    // Add friend
     const addFriend = async (e: React.FormEvent) => {
         e.preventDefault();
         const input = searchId.trim();
@@ -1449,7 +1022,6 @@ export default function ChatPage() {
         }
     };
 
-    // Clear cache
     const handleClearCache = async () => {
         if (confirm('Hapus semua cache pesan?')) {
             try {
@@ -1461,6 +1033,96 @@ export default function ChatPage() {
             }
         }
     };
+
+    return {
+        myUser,
+        friends,
+        requests,
+        activeChat,
+        messages,
+        inputText,
+        setInputText,
+        searchId,
+        setSearchId,
+        showNoti,
+        setShowNoti,
+        isSidebarOpen,
+        setIsSidebarOpen,
+        unreadCounts,
+        loadingMessages,
+        loadError,
+        uploadingFile,
+        showAttachMenu,
+        setShowAttachMenu,
+        filePreview,
+        setFilePreview,
+        showBackupModal,
+        showRestoreModal,
+        initializingKeys,
+        chatBoxRef,
+        currentSharedSecretRef,
+        fileInputRef,
+        imageInputRef,
+        videoInputRef,
+        handleSetupBackup,
+        handleRestoreBackup,
+        handleSkipRestore,
+        selectChat,
+        sendMessage,
+        handleFileSelect,
+        confirmSendFile,
+        cancelFilePreview,
+        handleVoiceRecord,
+        addFriend,
+        handleClearCache,
+        respondRequest
+    };
+}
+
+// ==================== MAIN CHAT COMPONENT ====================
+export default function ChatPage() {
+    const {
+        myUser,
+        friends,
+        requests,
+        activeChat,
+        messages,
+        inputText,
+        setInputText,
+        searchId,
+        setSearchId,
+        showNoti,
+        setShowNoti,
+        isSidebarOpen,
+        setIsSidebarOpen,
+        unreadCounts,
+        loadingMessages,
+        loadError,
+        uploadingFile,
+        showAttachMenu,
+        setShowAttachMenu,
+        filePreview,
+        showBackupModal,
+        showRestoreModal,
+        initializingKeys,
+        chatBoxRef,
+        currentSharedSecretRef,
+        fileInputRef,
+        imageInputRef,
+        videoInputRef,
+        handleSetupBackup,
+        handleRestoreBackup,
+        handleSkipRestore,
+        selectChat,
+        sendMessage,
+        handleFileSelect,
+        confirmSendFile,
+        cancelFilePreview,
+        handleVoiceRecord,
+        addFriend,
+        handleClearCache,
+        respondRequest
+    } = useChatPageHook();
 
     if (!myUser || initializingKeys) {
         return (
@@ -1475,13 +1137,12 @@ export default function ChatPage() {
 
     return (
         <div className="flex h-screen bg-background text-foreground overflow-hidden border-t border-border">
-            {/* Modals */}
             {showBackupModal && (
                 <KeyBackupModal onSetupComplete={handleSetupBackup} />
             )}
 
             {showRestoreModal && (
-                <KeyRestoreModal 
+                <KeyRestoreModal
                     onRestore={handleRestoreBackup}
                     onSkip={handleSkipRestore}
                 />
@@ -1495,7 +1156,6 @@ export default function ChatPage() {
                 />
             )}
 
-            {/* Hidden file inputs */}
             <input
                 ref={imageInputRef}
                 type="file"
@@ -1529,302 +1189,61 @@ export default function ChatPage() {
                 }}
             />
 
-            {/* Sidebar overlay */}
-            <div 
-                className={`fixed inset-0 bg-black/50 z-40 md:hidden ${isSidebarOpen ? 'block' : 'hidden'}`} 
-                onClick={() => setIsSidebarOpen(false)} 
+            <div
+                className={`fixed inset-0 bg-black/50 z-40 md:hidden ${isSidebarOpen ? 'block' : 'hidden'}`}
+                onClick={() => setIsSidebarOpen(false)}
             />
 
-            {/* Sidebar */}
-            <aside className={`fixed md:relative inset-y-0 left-0 w-80 bg-card border-r border-border flex flex-col z-50 transition-transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
-                <div className="p-4 border-b border-border flex items-center justify-between">
-                    <div>
-                        <h1 className="text-sm font-bold uppercase tracking-tighter">Bitlab Chat</h1>
-                        <p className="text-[9px] text-emerald-500 font-bold">ECDH ENCRYPTED</p>
-                    </div>
-                    <button 
-                        onClick={() => setShowNoti(!showNoti)} 
-                        className="relative p-2 hover:bg-accent rounded-md"
-                    >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
-                        </svg>
-                        {(requests.length > 0 || Object.values(unreadCounts).reduce((a,b)=>a+b,0) > 0) && (
-                            <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[10px] font-bold px-1 animate-pulse">
-                                {requests.length + Object.values(unreadCounts).reduce((a,b)=>a+b,0)}
-                            </span>
-                        )}
-                    </button>
-                </div>
+            <Sidebar
+                myUser={myUser}
+                friends={friends}
+                requests={requests}
+                activeChat={activeChat}
+                unreadCounts={unreadCounts}
+                searchId={searchId}
+                setSearchId={setSearchId}
+                isSidebarOpen={isSidebarOpen}
+                setIsSidebarOpen={setIsSidebarOpen}
+                showNoti={showNoti}
+                setShowNoti={setShowNoti}
+                onAddFriend={addFriend}
+                onSelectChat={selectChat}
+                onClearCache={handleClearCache}
+                respondRequest={respondRequest}
+            />
 
-                {showNoti && (
-                    <div className="absolute top-14 left-4 right-4 bg-popover border border-border shadow-xl rounded-lg z-[60] py-2">
-                        <p className="px-4 py-1 text-[10px] font-bold text-muted-foreground uppercase">Requests</p>
-                        {requests.length === 0 ? (
-                            <p className="px-4 py-3 text-xs">No pending requests</p>
-                        ) : (
-                            requests.map(req => (
-                                <div key={req.id} className="px-4 py-2 flex items-center justify-between border-b last:border-0">
-                                    <span className="text-xs truncate font-medium">
-                                        {req.expand?.user?.name || req.expand?.user?.email}
-                                    </span>
-                                    <div className="flex gap-1">
-                                        <button 
-                                            onClick={() => respondRequest(req.id, 'accepted')} 
-                                            className="px-2 py-1 bg-primary text-white text-[10px] rounded"
-                                        >
-                                            Accept
-                                        </button>
-                                        <button 
-                                            onClick={() => respondRequest(req.id, 'reject')} 
-                                            className="px-2 py-1 bg-destructive text-white text-[10px] rounded"
-                                        >
-                                            Reject
-                                        </button>
-                                    </div>
-                                </div>
-                            ))
-                        )}
-                    </div>
-                )}
-
-                <div className="p-4">
-                    <form onSubmit={addFriend} className="flex gap-2">
-                        <input 
-                            value={searchId} 
-                            onChange={(e) => setSearchId(e.target.value)} 
-                            placeholder="User ID / Email" 
-                            className="flex-1 h-9 bg-transparent border border-input rounded-md px-3 text-xs outline-none" 
-                        />
-                        <button 
-                            type="submit" 
-                            className="h-9 px-3 bg-secondary text-secondary-foreground rounded-md text-[10px] font-bold"
-                        >
-                            ADD
-                        </button>
-                    </form>
-                </div>
-
-                <div className="flex-1 overflow-y-auto px-2 space-y-1">
-                    <p className="px-2 text-[10px] font-bold text-muted-foreground uppercase mb-2">
-                        Direct Messages
-                    </p>
-                    {friends.map(f => {
-                        const friendData = f.user === myUser.id ? f.expand?.friend : f.expand?.user;
-                        const unread = unreadCounts[friendData?.id] || 0;
-                        return (
-                            <button 
-                                key={f.id} 
-                                onClick={() => selectChat(f)} 
-                                className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent' : 'hover:bg-accent/40'}`}
-                            >
-                                <div className="relative">
-                                    <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">
-                                        {(friendData?.name || 'U')[0].toUpperCase()}
-                                    </div>
-                                    {unread > 0 && (
-                                        <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] font-bold px-1 border-2 border-card">
-                                            {unread}
-                                        </span>
-                                    )}
-                                </div>
-                                <div className="text-left truncate flex-1">
-                                    <div className="text-sm font-semibold truncate">
-                                        {friendData?.name || friendData?.email}
-                                    </div>
-                                    <p className={`text-[10px] font-bold ${unread > 0 ? 'text-red-500' : 'text-emerald-500'}`}>
-                                        {unread > 0 ? `${unread} pesan baru` : 'E2EE Active'}
-                                    </p>
-                                </div>
-                            </button>
-                        );
-                    })}
-                </div>
-
-                <div className="p-4 border-t border-border bg-muted/20 space-y-2">
-                    <button 
-                        onClick={() => window.location.href = "/profile"} 
-                        className="w-full flex items-center gap-3 p-2 rounded-md hover:bg-accent group"
-                    >
-                        <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-[10px] font-bold text-primary-foreground">
-                            {(myUser.name || 'M')[0].toUpperCase()}
-                        </div>
-                        <div className="flex-1 text-left truncate">
-                            <p className="text-xs font-bold truncate">{myUser.name || myUser.username}</p>
-                        </div>
-                    </button>
-                    <button 
-                        onClick={handleClearCache} 
-                        className="w-full flex items-center gap-2 p-2 text-xs text-muted-foreground hover:text-foreground"
-                    >
-                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
-                        <span>Clear Cache</span>
-                    </button>
-                </div>
-            </aside>
-
-            {/* Main chat area */}
             <main className="flex-1 flex flex-col bg-background">
-                <header className="h-14 border-b border-border flex items-center px-4 justify-between bg-background/95 backdrop-blur sticky top-0 z-30">
-                    <div className="flex items-center gap-3">
-                        <button 
-                            onClick={() => setIsSidebarOpen(true)} 
-                            className="md:hidden p-2 -ml-2 hover:bg-accent rounded-md"
-                        >
-                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" />
-                            </svg>
-                        </button>
-                        {activeChat && (
-                            <div className="flex items-center gap-2">
-                                <div className="w-8 h-8 rounded-full bg-secondary flex items-center justify-center text-[10px] font-bold border border-border shadow-sm">
-                                    {(activeChat.name || 'U')[0].toUpperCase()}
-                                </div>
-                                <div>
-                                    <h2 className="text-sm font-bold leading-none">
-                                        {activeChat.name || activeChat.email}
-                                    </h2>
-                                    <p className="text-[10px] text-emerald-500 font-bold mt-0.5">
-                                        ECDH E2EE
-                                    </p>
-                                </div>
-                            </div>
-                        )}
-                    </div>
-                </header>
+                <ChatHeader
+                    activeChat={activeChat}
+                    onOpenSidebar={() => setIsSidebarOpen(true)}
+                />
 
                 {!activeChat ? (
-                    <div className="flex-1 flex flex-col items-center justify-center space-y-3 opacity-30">
-                        <svg className="w-16 h-16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                        </svg>
-                        <p className="text-[10px] font-bold uppercase tracking-widest">Select a chat</p>
-                    </div>
+                    <EmptyState />
                 ) : (
-                    <>
-                        <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 space-y-4">
-                            {loadingMessages ? (
-                                <div className="flex items-center justify-center h-full">
-                                    <div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin"></div>
-                                </div>
-                            ) : loadError ? (
-                                <div className="flex items-center justify-center h-full text-center">
-                                    <p className="text-destructive text-sm">{loadError}</p>
-                                </div>
-                            ) : (
-                                messages.map((m, idx) => (
-                                    <div 
-                                        key={m.id || idx} 
-                                        className={`flex ${m.sender === myUser.id ? 'justify-end' : 'justify-start'}`}
-                                    >
-                                        <div className={`max-w-[75%] p-3 rounded-2xl text-sm ${m.sender === myUser.id ? 'bg-primary text-primary-foreground rounded-tr-none' : 'bg-muted rounded-tl-none'}`}>
-                                            {(!m.type || m.type === 'text') ? (
-                                                <DecryptedMessage 
-                                                    text={m.text} 
-                                                    sharedSecret={currentSharedSecretRef.current}
-                                                />
-                                            ) : (
-                                                <DecryptedFile 
-                                                    message={m}
-                                                    sharedSecret={currentSharedSecretRef.current}
-                                                />
-                                            )}
-                                            <p className="text-[8px] opacity-50 mt-1 text-right">
-                                                {new Date(m.created).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}
-                                            </p>
-                                        </div>
-                                    </div>
-                                ))
-                            )}
-                        </div>
-
-                        <form onSubmit={sendMessage} className="p-4 border-t border-border bg-background">
-                            {uploadingFile && (
-                                <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
-                                    <div className="w-3 h-3 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
-                                    <span>Mengenkripsi dan mengirim...</span>
-                                </div>
-                            )}
-
-                            <div className="flex gap-2 items-center">
-                                {/* Attach button */}
-                                <div className="relative">
-                                    <button
-                                        type="button"
-                                        onClick={() => setShowAttachMenu(!showAttachMenu)}
-                                        className="w-10 h-10 bg-secondary text-secondary-foreground rounded-full flex items-center justify-center hover:bg-secondary/80 transition-colors"
-                                        disabled={uploadingFile}
-                                    >
-                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
-                                        </svg>
-                                    </button>
-
-                                    {showAttachMenu && (
-                                        <div className="absolute bottom-full left-0 mb-2 bg-popover border border-border rounded-lg shadow-xl p-2 space-y-1 min-w-[160px]">
-                                            <button
-                                                type="button"
-                                                onClick={() => { imageInputRef.current?.click(); setShowAttachMenu(false); }}
-                                                className="w-full flex items-center gap-2 px-3 py-2 hover:bg-accent rounded text-sm"
-                                            >
-                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                                                </svg>
-                                                <span>Gambar</span>
-                                            </button>
-                                            <button
-                                                type="button"
-                                                onClick={() => { videoInputRef.current?.click(); setShowAttachMenu(false); }}
-                                                className="w-full flex items-center gap-2 px-3 py-2 hover:bg-accent rounded text-sm"
-                                            >
-                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                                </svg>
-                                                <span>Video</span>
-                                            </button>
-                                            <button
-                                                type="button"
-                                                onClick={() => { fileInputRef.current?.click(); setShowAttachMenu(false); }}
-                                                className="w-full flex items-center gap-2 px-3 py-2 hover:bg-accent rounded text-sm"
-                                            >
-                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                                                </svg>
-                                                <span>File</span>
-                                            </button>
-                                        </div>
-                                    )}
-                                </div>
-
-                                {/* Voice recorder */}
-                                <VoiceRecorder onRecord={handleVoiceRecord} />
-
-                                {/* Text input */}
-                                <input
-                                    value={inputText}
-                                    onChange={(e) => setInputText(e.target.value)}
-                                    placeholder="Type a message..."
-                                    className="flex-1 h-10 bg-muted rounded-full px-4 text-sm outline-none focus:ring-2 focus:ring-primary"
-                                    disabled={uploadingFile}
-                                />
-
-                                {/* Send button */}
-                                <button
-                                    type="submit"
-                                    className="w-10 h-10 bg-primary text-primary-foreground rounded-full flex items-center justify-center active:scale-95 transition-transform disabled:opacity-50"
-                                    disabled={uploadingFile}
-                                >
-                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-                                    </svg>
-                                </button>
-                            </div>
-                        </form>
-                    </>
+                    <ChatContainer
+                        myUser={myUser}
+                        activeChat={activeChat}
+                        messages={messages}
+                        loadingMessages={loadingMessages}
+                        loadError={loadError}
+                        chatBoxRef={chatBoxRef}
+                        currentSharedSecretRef={currentSharedSecretRef}
+                        inputText={inputText}
+                        setInputText={setInputText}
+                        uploadingFile={uploadingFile}
+                        showAttachMenu={showAttachMenu}
+                        setShowAttachMenu={setShowAttachMenu}
+                        sendMessage={sendMessage}
+                        handleFileSelect={handleFileSelect}
+                        handleVoiceRecord={handleVoiceRecord}
+                        fileInputRef={fileInputRef}
+                        imageInputRef={imageInputRef}
+                        videoInputRef={videoInputRef}
+                    />
                 )}
             </main>
+            <NotificationPermissionBanner />
         </div>
     );
 }

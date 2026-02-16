@@ -2,14 +2,9 @@
 
 import { useEffect, useState, useRef } from 'react';
 import PocketBase from 'pocketbase';
-import * as CryptoJS from 'crypto-js';
 
 const PB_URL = process.env.NEXT_PUBLIC_PB_URL || "";
 const pb = new PocketBase(PB_URL);
-
-const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "";
-const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "";
-const INTERNAL_APP_KEY = KEY1 + KEY2;
 
 // --- TYPE DEFINITIONS ---
 type MessageType = 'text' | 'image' | 'video' | 'audio' | 'file';
@@ -26,60 +21,586 @@ interface FilePreview {
     previewUrl?: string;
 }
 
-// --- GCM HELPER FUNCTIONS ---
-async function getCryptoKey(rawKey: string) {
-    const enc = new TextEncoder();
-    const keyData = enc.encode(rawKey.padEnd(32, '0').slice(0, 32));
-    return window.crypto.subtle.importKey("raw", keyData, "AES-GCM", false, ["encrypt", "decrypt"]);
+interface StoredKeyPair {
+    publicKey: JsonWebKey;
+    privateKey: JsonWebKey;
+    userId: string;
+    timestamp: number;
 }
 
-async function encryptGCM(text: string, secretKey: string) {
-    const enc = new TextEncoder();
-    const key = await getCryptoKey(secretKey);
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-    const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(text));
-    const combined = new Uint8Array(iv.length + encrypted.byteLength);
-    combined.set(iv);
-    combined.set(new Uint8Array(encrypted), iv.length);
-    return btoa(String.fromCharCode(...combined));
-}
+// ==================== INDEXEDDB MANAGER ====================
+class SecureIndexedDB {
+    private dbName = 'BitlabSecureChat';
+    private version = 1;
+    private db: IDBDatabase | null = null;
 
-async function decryptGCM(base64Data: string, secretKey: string) {
-    try {
-        const key = await getCryptoKey(secretKey);
-        const combined = new Uint8Array(atob(base64Data).split("").map(c => c.charCodeAt(0)));
-        const iv = combined.slice(0, 12);
-        const data = combined.slice(12);
-        const decrypted = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
-        return new TextDecoder().decode(decrypted);
-    } catch (e) {
-        // Fallback untuk pesan lama (non-GCM)
-        try {
-            const bytes = CryptoJS.AES.decrypt(base64Data, secretKey);
-            const originalText = bytes.toString(CryptoJS.enc.Utf8);
-            return originalText || "⚠️ Pesan tidak dapat didekripsi.";
-        } catch (err) {
-            return "⚠️ Kesalahan dekripsi.";
-        }
+    async init(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.version);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                this.db = request.result;
+                resolve();
+            };
+
+            request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
+                const db = (event.target as IDBOpenDBRequest).result;
+
+                // Store for ECDH key pairs
+                if (!db.objectStoreNames.contains('keyPairs')) {
+                    db.createObjectStore('keyPairs', { keyPath: 'userId' });
+                }
+
+                // Store for cached messages
+                if (!db.objectStoreNames.contains('messages')) {
+                    const msgStore = db.createObjectStore('messages', { keyPath: 'cacheKey' });
+                    msgStore.createIndex('userId', 'userId', { unique: false });
+                    msgStore.createIndex('timestamp', 'timestamp', { unique: false });
+                }
+
+                // Store for shared secrets cache
+                if (!db.objectStoreNames.contains('sharedSecrets')) {
+                    db.createObjectStore('sharedSecrets', { keyPath: 'id' });
+                }
+            };
+        });
+    }
+
+    async saveKeyPair(userId: string, publicKey: JsonWebKey, privateKey: JsonWebKey): Promise<void> {
+        if (!this.db) throw new Error('Database not initialized');
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(['keyPairs'], 'readwrite');
+            const store = tx.objectStore('keyPairs');
+            const data: StoredKeyPair = { userId, publicKey, privateKey, timestamp: Date.now() };
+            
+            const request = store.put(data);
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async getKeyPair(userId: string): Promise<StoredKeyPair | null> {
+        if (!this.db) throw new Error('Database not initialized');
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(['keyPairs'], 'readonly');
+            const store = tx.objectStore('keyPairs');
+            const request = store.get(userId);
+
+            request.onsuccess = () => resolve(request.result || null);
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async saveMessages(userId: string, friendId: string, messages: any[]): Promise<void> {
+        if (!this.db) throw new Error('Database not initialized');
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(['messages'], 'readwrite');
+            const store = tx.objectStore('messages');
+            const cacheKey = `${userId}_${friendId}`;
+            
+            const request = store.put({
+                cacheKey,
+                userId,
+                friendId,
+                messages,
+                timestamp: Date.now()
+            });
+
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async getMessages(userId: string, friendId: string): Promise<any[] | null> {
+        if (!this.db) throw new Error('Database not initialized');
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(['messages'], 'readonly');
+            const store = tx.objectStore('messages');
+            const cacheKey = `${userId}_${friendId}`;
+            const request = store.get(cacheKey);
+
+            request.onsuccess = () => {
+                const data = request.result;
+                if (!data) return resolve(null);
+                
+                // Expire after 7 days
+                if (Date.now() - data.timestamp > 7 * 24 * 60 * 60 * 1000) {
+                    this.deleteMessages(userId, friendId);
+                    return resolve(null);
+                }
+                
+                resolve(data.messages);
+            };
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async deleteMessages(userId: string, friendId: string): Promise<void> {
+        if (!this.db) throw new Error('Database not initialized');
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(['messages'], 'readwrite');
+            const store = tx.objectStore('messages');
+            const cacheKey = `${userId}_${friendId}`;
+            const request = store.delete(cacheKey);
+
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async clearAllMessages(userId: string): Promise<void> {
+        if (!this.db) throw new Error('Database not initialized');
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(['messages'], 'readwrite');
+            const store = tx.objectStore('messages');
+            const index = store.index('userId');
+            const request = index.openCursor(IDBKeyRange.only(userId));
+
+            request.onsuccess = (event) => {
+                const cursor = (event.target as IDBRequest).result;
+                if (cursor) {
+                    cursor.delete();
+                    cursor.continue();
+                } else {
+                    resolve();
+                }
+            };
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async saveSharedSecret(id: string, secret: string): Promise<void> {
+        if (!this.db) throw new Error('Database not initialized');
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(['sharedSecrets'], 'readwrite');
+            const store = tx.objectStore('sharedSecrets');
+            const request = store.put({ id, secret, timestamp: Date.now() });
+
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async getSharedSecret(id: string): Promise<string | null> {
+        if (!this.db) throw new Error('Database not initialized');
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db!.transaction(['sharedSecrets'], 'readonly');
+            const store = tx.objectStore('sharedSecrets');
+            const request = store.get(id);
+
+            request.onsuccess = () => {
+                const data = request.result;
+                resolve(data ? data.secret : null);
+            };
+            request.onerror = () => reject(request.error);
+        });
     }
 }
 
-// --- SUB-COMPONENT UNTUK DISPLAY TEXT ---
-function DecryptedMessage({ text, secretKey }: { text: string; secretKey: string }) {
+const secureDB = new SecureIndexedDB();
+
+// ==================== ECDH CRYPTO FUNCTIONS ====================
+class ECDHCrypto {
+    // Generate ECDH key pair
+    static async generateKeyPair(): Promise<CryptoKeyPair> {
+        return window.crypto.subtle.generateKey(
+            {
+                name: "ECDH",
+                namedCurve: "P-256"
+            },
+            true,
+            ["deriveKey", "deriveBits"]
+        );
+    }
+
+    // Export public key to JWK format
+    static async exportPublicKey(publicKey: CryptoKey): Promise<JsonWebKey> {
+        return window.crypto.subtle.exportKey("jwk", publicKey);
+    }
+
+    // Export private key to JWK format
+    static async exportPrivateKey(privateKey: CryptoKey): Promise<JsonWebKey> {
+        return window.crypto.subtle.exportKey("jwk", privateKey);
+    }
+
+    // Import public key from JWK
+    static async importPublicKey(jwk: JsonWebKey): Promise<CryptoKey> {
+        return window.crypto.subtle.importKey(
+            "jwk",
+            jwk,
+            { name: "ECDH", namedCurve: "P-256" },
+            true,
+            []
+        );
+    }
+
+    // Import private key from JWK
+    static async importPrivateKey(jwk: JsonWebKey): Promise<CryptoKey> {
+        return window.crypto.subtle.importKey(
+            "jwk",
+            jwk,
+            { name: "ECDH", namedCurve: "P-256" },
+            true,
+            ["deriveKey", "deriveBits"]
+        );
+    }
+
+    // Derive shared secret between two parties
+    static async deriveSharedSecret(privateKey: CryptoKey, publicKey: CryptoKey): Promise<CryptoKey> {
+        return window.crypto.subtle.deriveKey(
+            { name: "ECDH", public: publicKey },
+            privateKey,
+            { name: "AES-GCM", length: 256 },
+            true,
+            ["encrypt", "decrypt"]
+        );
+    }
+
+    // Encrypt private key with passphrase for backup
+    static async encryptPrivateKeyWithPassphrase(privateKeyJwk: JsonWebKey, passphrase: string): Promise<string> {
+        const encoder = new TextEncoder();
+        const passphraseData = encoder.encode(passphrase);
+        
+        // Derive key from passphrase
+        const passphraseKey = await window.crypto.subtle.importKey(
+            "raw",
+            passphraseData,
+            "PBKDF2",
+            false,
+            ["deriveBits", "deriveKey"]
+        );
+
+        const salt = window.crypto.getRandomValues(new Uint8Array(16));
+        const derivedKey = await window.crypto.subtle.deriveKey(
+            {
+                name: "PBKDF2",
+                salt: salt,
+                iterations: 100000,
+                hash: "SHA-256"
+            },
+            passphraseKey,
+            { name: "AES-GCM", length: 256 },
+            true,
+            ["encrypt", "decrypt"]
+        );
+
+        // Encrypt private key
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+        const privateKeyString = JSON.stringify(privateKeyJwk);
+        const encrypted = await window.crypto.subtle.encrypt(
+            { name: "AES-GCM", iv },
+            derivedKey,
+            encoder.encode(privateKeyString)
+        );
+
+        // Combine salt + iv + encrypted data
+        const combined = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
+        combined.set(salt, 0);
+        combined.set(iv, salt.length);
+        combined.set(new Uint8Array(encrypted), salt.length + iv.length);
+
+        return btoa(String.fromCharCode(...combined));
+    }
+
+    // Decrypt private key with passphrase
+    static async decryptPrivateKeyWithPassphrase(encryptedData: string, passphrase: string): Promise<JsonWebKey> {
+        const encoder = new TextEncoder();
+        const decoder = new TextDecoder();
+        const passphraseData = encoder.encode(passphrase);
+
+        // Decode combined data
+        const combined = new Uint8Array(atob(encryptedData).split("").map(c => c.charCodeAt(0)));
+        const salt = combined.slice(0, 16);
+        const iv = combined.slice(16, 28);
+        const encrypted = combined.slice(28);
+
+        // Derive key from passphrase
+        const passphraseKey = await window.crypto.subtle.importKey(
+            "raw",
+            passphraseData,
+            "PBKDF2",
+            false,
+            ["deriveBits", "deriveKey"]
+        );
+
+        const derivedKey = await window.crypto.subtle.deriveKey(
+            {
+                name: "PBKDF2",
+                salt: salt,
+                iterations: 100000,
+                hash: "SHA-256"
+            },
+            passphraseKey,
+            { name: "AES-GCM", length: 256 },
+            true,
+            ["encrypt", "decrypt"]
+        );
+
+        // Decrypt private key
+        const decrypted = await window.crypto.subtle.decrypt(
+            { name: "AES-GCM", iv },
+            derivedKey,
+            encrypted
+        );
+
+        const privateKeyString = decoder.decode(decrypted);
+        return JSON.parse(privateKeyString);
+    }
+
+    // Encrypt text with AES-GCM
+    static async encryptMessage(text: string, sharedSecret: CryptoKey): Promise<string> {
+        const encoder = new TextEncoder();
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+        
+        const encrypted = await window.crypto.subtle.encrypt(
+            { name: "AES-GCM", iv },
+            sharedSecret,
+            encoder.encode(text)
+        );
+
+        const combined = new Uint8Array(iv.length + encrypted.byteLength);
+        combined.set(iv);
+        combined.set(new Uint8Array(encrypted), iv.length);
+
+        return btoa(String.fromCharCode(...combined));
+    }
+
+    // Decrypt text with AES-GCM
+    static async decryptMessage(encryptedData: string, sharedSecret: CryptoKey): Promise<string> {
+        const decoder = new TextDecoder();
+        const combined = new Uint8Array(atob(encryptedData).split("").map(c => c.charCodeAt(0)));
+        const iv = combined.slice(0, 12);
+        const data = combined.slice(12);
+
+        const decrypted = await window.crypto.subtle.decrypt(
+            { name: "AES-GCM", iv },
+            sharedSecret,
+            data
+        );
+
+        return decoder.decode(decrypted);
+    }
+}
+
+// ==================== KEY BACKUP MODAL ====================
+function KeyBackupModal({ 
+    onSetupComplete 
+}: { 
+    onSetupComplete: (passphrase: string) => void;
+}) {
+    const [passphrase, setPassphrase] = useState("");
+    const [confirmPassphrase, setConfirmPassphrase] = useState("");
+    const [error, setError] = useState("");
+
+    const handleSubmit = (e: React.FormEvent) => {
+        e.preventDefault();
+        setError("");
+
+        if (passphrase.length < 8) {
+            setError("Passphrase harus minimal 8 karakter");
+            return;
+        }
+
+        if (passphrase !== confirmPassphrase) {
+            setError("Passphrase tidak cocok");
+            return;
+        }
+
+        onSetupComplete(passphrase);
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black/90 z-[200] flex items-center justify-center p-4">
+            <div className="bg-card border border-border rounded-lg max-w-md w-full p-6">
+                <div className="text-center mb-6">
+                    <div className="w-16 h-16 bg-primary/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <svg className="w-8 h-8 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                        </svg>
+                    </div>
+                    <h2 className="text-xl font-bold mb-2">Setup Backup Passphrase</h2>
+                    <p className="text-sm text-muted-foreground">
+                        Buat passphrase untuk backup kunci enkripsi Anda. 
+                        Passphrase ini diperlukan untuk memulihkan chat di perangkat baru.
+                    </p>
+                </div>
+
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label className="block text-sm font-medium mb-2">Passphrase Backup</label>
+                        <input
+                            type="password"
+                            value={passphrase}
+                            onChange={(e) => setPassphrase(e.target.value)}
+                            className="w-full h-10 bg-background border border-input rounded-md px-3 text-sm outline-none focus:ring-2 focus:ring-primary"
+                            placeholder="Minimal 8 karakter"
+                            required
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium mb-2">Konfirmasi Passphrase</label>
+                        <input
+                            type="password"
+                            value={confirmPassphrase}
+                            onChange={(e) => setConfirmPassphrase(e.target.value)}
+                            className="w-full h-10 bg-background border border-input rounded-md px-3 text-sm outline-none focus:ring-2 focus:ring-primary"
+                            placeholder="Ulangi passphrase"
+                            required
+                        />
+                    </div>
+
+                    {error && (
+                        <div className="p-3 bg-destructive/10 border border-destructive/20 rounded-md">
+                            <p className="text-xs text-destructive">{error}</p>
+                        </div>
+                    )}
+
+                    <div className="bg-amber-500/10 border border-amber-500/20 rounded-md p-3">
+                        <p className="text-xs text-amber-600 dark:text-amber-400 font-medium">
+                            ⚠️ PENTING: Simpan passphrase ini dengan aman! Tanpa passphrase, 
+                            Anda tidak dapat membaca chat lama di perangkat baru.
+                        </p>
+                    </div>
+
+                    <button
+                        type="submit"
+                        className="w-full h-10 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 transition-colors"
+                    >
+                        Buat Backup
+                    </button>
+                </form>
+            </div>
+        </div>
+    );
+}
+
+// ==================== KEY RESTORE MODAL ====================
+function KeyRestoreModal({ 
+    onRestore,
+    onSkip
+}: { 
+    onRestore: (passphrase: string) => Promise<boolean>;
+    onSkip: () => void;
+}) {
+    const [passphrase, setPassphrase] = useState("");
+    const [error, setError] = useState("");
+    const [loading, setLoading] = useState(false);
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setError("");
+        setLoading(true);
+
+        try {
+            const success = await onRestore(passphrase);
+            if (!success) {
+                setError("Passphrase salah atau backup tidak ditemukan");
+            }
+        } catch (err) {
+            setError("Gagal memulihkan kunci: " + (err as Error).message);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black/90 z-[200] flex items-center justify-center p-4">
+            <div className="bg-card border border-border rounded-lg max-w-md w-full p-6">
+                <div className="text-center mb-6">
+                    <div className="w-16 h-16 bg-primary/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <svg className="w-8 h-8 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                        </svg>
+                    </div>
+                    <h2 className="text-xl font-bold mb-2">Pulihkan Kunci Enkripsi</h2>
+                    <p className="text-sm text-muted-foreground">
+                        Masukkan passphrase backup Anda untuk memulihkan chat lama.
+                    </p>
+                </div>
+
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label className="block text-sm font-medium mb-2">Passphrase Backup</label>
+                        <input
+                            type="password"
+                            value={passphrase}
+                            onChange={(e) => setPassphrase(e.target.value)}
+                            className="w-full h-10 bg-background border border-input rounded-md px-3 text-sm outline-none focus:ring-2 focus:ring-primary"
+                            placeholder="Masukkan passphrase"
+                            required
+                            disabled={loading}
+                        />
+                    </div>
+
+                    {error && (
+                        <div className="p-3 bg-destructive/10 border border-destructive/20 rounded-md">
+                            <p className="text-xs text-destructive">{error}</p>
+                        </div>
+                    )}
+
+                    <div className="flex gap-2">
+                        <button
+                            type="button"
+                            onClick={onSkip}
+                            className="flex-1 h-10 bg-secondary text-secondary-foreground rounded-md font-medium hover:bg-secondary/80 transition-colors"
+                            disabled={loading}
+                        >
+                            Lewati
+                        </button>
+                        <button
+                            type="submit"
+                            className="flex-1 h-10 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                            disabled={loading}
+                        >
+                            {loading && <div className="w-4 h-4 border-2 border-primary-foreground border-t-transparent rounded-full animate-spin"></div>}
+                            Pulihkan
+                        </button>
+                    </div>
+
+                    <p className="text-xs text-muted-foreground text-center">
+                        Jika lewati, Anda akan membuat kunci baru dan tidak bisa membaca chat lama.
+                    </p>
+                </form>
+            </div>
+        </div>
+    );
+}
+
+// ==================== DECRYPTED MESSAGE COMPONENT ====================
+function DecryptedMessage({ text, sharedSecret }: { text: string; sharedSecret: CryptoKey | null }) {
     const [decrypted, setDecrypted] = useState("...");
+
     useEffect(() => {
-        decryptGCM(text, secretKey).then(setDecrypted);
-    }, [text, secretKey]);
+        if (!sharedSecret) {
+            setDecrypted("⚠️ Kunci tidak tersedia");
+            return;
+        }
+
+        ECDHCrypto.decryptMessage(text, sharedSecret)
+            .then(setDecrypted)
+            .catch(() => setDecrypted("⚠️ Gagal dekripsi"));
+    }, [text, sharedSecret]);
+
     return <p className="whitespace-pre-wrap break-words">{decrypted}</p>;
 }
 
-// --- SUB-COMPONENT UNTUK DISPLAY FILE ---
+// ==================== DECRYPTED FILE COMPONENT ====================
 function DecryptedFile({ 
     message,
-    secretKey, 
+    sharedSecret, 
 }: { 
     message: any;
-    secretKey: string; 
+    sharedSecret: CryptoKey | null;
 }) {
     const [fileUrl, setFileUrl] = useState<string>("");
     const [metadata, setMetadata] = useState<FileMetadata | null>(null);
@@ -90,35 +611,36 @@ function DecryptedFile({
         let objectUrl = "";
         
         const decrypt = async () => {
+            if (!sharedSecret) {
+                setError(true);
+                setLoading(false);
+                return;
+            }
+
             try {
                 setLoading(true);
                 setError(false);
                 
-                // Decrypt metadata from text field
-                const decryptedMetaStr = await decryptGCM(message.text, secretKey);
+                // Decrypt metadata
+                const decryptedMetaStr = await ECDHCrypto.decryptMessage(message.text, sharedSecret);
                 const meta: FileMetadata = JSON.parse(decryptedMetaStr);
                 setMetadata(meta);
                 
-                // Get file attachment from PocketBase
-                if (!message.file) {
-                    throw new Error("No file attachment");
-                }
+                if (!message.file) throw new Error("No file attachment");
                 
-                // Fetch encrypted file
+                // Fetch and decrypt file
                 const fileUrl = pb.files.getUrl(message, message.file);
                 const response = await fetch(fileUrl);
                 const encryptedBlob = await response.blob();
                 const encryptedArrayBuffer = await encryptedBlob.arrayBuffer();
                 
-                // Decrypt file content (direct binary processing)
                 const encryptedArray = new Uint8Array(encryptedArrayBuffer);
                 const iv = encryptedArray.slice(0, 12);
                 const data = encryptedArray.slice(12);
                 
-                const key = await getCryptoKey(secretKey);
                 const decryptedBuffer = await window.crypto.subtle.decrypt(
-                    { name: "AES-GCM", iv }, 
-                    key, 
+                    { name: "AES-GCM", iv },
+                    sharedSecret,
                     data
                 );
                 
@@ -138,7 +660,7 @@ function DecryptedFile({
         return () => {
             if (objectUrl) URL.revokeObjectURL(objectUrl);
         };
-    }, [message, secretKey]);
+    }, [message, sharedSecret]);
 
     if (loading) {
         return (
@@ -157,7 +679,6 @@ function DecryptedFile({
         );
     }
 
-    // Render berdasarkan tipe
     if (message.type === 'image') {
         return (
             <div className="max-w-sm">
@@ -189,7 +710,6 @@ function DecryptedFile({
         );
     }
 
-    // File biasa
     return (
         <a 
             href={fileUrl} 
@@ -212,7 +732,7 @@ function DecryptedFile({
     );
 }
 
-// --- FILE PREVIEW MODAL COMPONENT ---
+// ==================== FILE PREVIEW MODAL ====================
 function FilePreviewModal({ 
     preview, 
     onSend, 
@@ -225,7 +745,6 @@ function FilePreviewModal({
     return (
         <div className="fixed inset-0 bg-black/80 z-[100] flex items-center justify-center p-4">
             <div className="bg-card border border-border rounded-lg max-w-2xl w-full max-h-[90vh] overflow-hidden flex flex-col">
-                {/* Header */}
                 <div className="p-4 border-b border-border flex items-center justify-between">
                     <h3 className="font-bold text-sm">Preview File</h3>
                     <button onClick={onCancel} className="p-1 hover:bg-accent rounded">
@@ -235,7 +754,6 @@ function FilePreviewModal({
                     </button>
                 </div>
 
-                {/* Preview Content */}
                 <div className="flex-1 overflow-y-auto p-4 bg-muted/20">
                     <div className="flex flex-col items-center justify-center space-y-4">
                         {preview.type === 'image' && preview.previewUrl && (
@@ -251,28 +769,13 @@ function FilePreviewModal({
                                 controls 
                                 className="max-w-full max-h-[50vh] rounded-lg border border-border"
                                 src={preview.previewUrl}
-                            >
-                                Browser Anda tidak mendukung video.
-                            </video>
+                            />
                         )}
                         
                         {preview.type === 'audio' && preview.previewUrl && (
                             <div className="w-full max-w-md">
                                 <div className="p-4 bg-card rounded-lg border border-border">
-                                    <div className="flex items-center gap-3 mb-3">
-                                        <div className="w-12 h-12 bg-primary/20 rounded flex items-center justify-center">
-                                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
-                                            </svg>
-                                        </div>
-                                        <div className="flex-1 min-w-0">
-                                            <p className="text-sm font-medium truncate">{preview.file.name}</p>
-                                            <p className="text-xs text-muted-foreground">Audio File</p>
-                                        </div>
-                                    </div>
-                                    <audio controls className="w-full" src={preview.previewUrl}>
-                                        Browser Anda tidak mendukung audio.
-                                    </audio>
+                                    <audio controls className="w-full" src={preview.previewUrl} />
                                 </div>
                             </div>
                         )}
@@ -285,35 +788,14 @@ function FilePreviewModal({
                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
                                         </svg>
                                     </div>
-                                    <div className="text-center">
-                                        <p className="font-medium text-sm break-all">{preview.file.name}</p>
-                                        <p className="text-xs text-muted-foreground mt-1">
-                                            {(preview.file.size / 1024).toFixed(1)} KB
-                                        </p>
-                                    </div>
+                                    <p className="font-medium text-sm break-all">{preview.file.name}</p>
+                                    <p className="text-xs text-muted-foreground">{(preview.file.size / 1024).toFixed(1)} KB</p>
                                 </div>
                             </div>
                         )}
                     </div>
                 </div>
 
-                {/* File Info */}
-                <div className="p-4 bg-muted/30 border-t border-border">
-                    <div className="flex items-center justify-between text-xs mb-3">
-                        <span className="text-muted-foreground">Nama File:</span>
-                        <span className="font-medium truncate ml-2 max-w-[60%]">{preview.file.name}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-xs mb-3">
-                        <span className="text-muted-foreground">Ukuran:</span>
-                        <span className="font-medium">{(preview.file.size / 1024).toFixed(2)} KB</span>
-                    </div>
-                    <div className="flex items-center justify-between text-xs">
-                        <span className="text-muted-foreground">Tipe:</span>
-                        <span className="font-medium">{preview.file.type || 'Unknown'}</span>
-                    </div>
-                </div>
-
-                {/* Actions */}
                 <div className="p-4 border-t border-border flex gap-2">
                     <button
                         onClick={onCancel}
@@ -336,7 +818,7 @@ function FilePreviewModal({
     );
 }
 
-// --- VOICE RECORDER COMPONENT ---
+// ==================== VOICE RECORDER ====================
 function VoiceRecorder({ onRecord }: { onRecord: (blob: Blob) => void }) {
     const [isRecording, setIsRecording] = useState(false);
     const [duration, setDuration] = useState(0);
@@ -423,6 +905,7 @@ function VoiceRecorder({ onRecord }: { onRecord: (blob: Blob) => void }) {
     );
 }
 
+// ==================== MAIN CHAT COMPONENT ====================
 export default function ChatPage() {
     const [myUser, setMyUser] = useState<any>(null);
     const [friends, setFriends] = useState<any[]>([]);
@@ -436,67 +919,201 @@ export default function ChatPage() {
     const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
     const [loadingMessages, setLoadingMessages] = useState(false);
     const [loadError, setLoadError] = useState<string | null>(null);
-    const [isLoadingTimeout, setIsLoadingTimeout] = useState(false);
     const [uploadingFile, setUploadingFile] = useState(false);
     const [showAttachMenu, setShowAttachMenu] = useState(false);
     const [filePreview, setFilePreview] = useState<FilePreview | null>(null);
     
+    // ECDH state
+    const [showBackupModal, setShowBackupModal] = useState(false);
+    const [showRestoreModal, setShowRestoreModal] = useState(false);
+    const [myKeyPair, setMyKeyPair] = useState<CryptoKeyPair | null>(null);
+    const [sharedSecrets, setSharedSecrets] = useState<Map<string, CryptoKey>>(new Map());
+    const [initializingKeys, setInitializingKeys] = useState(true);
+    
     const chatBoxRef = useRef<HTMLDivElement>(null);
-    const currentChatKeyRef = useRef<string>("");
-    const loadingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const currentSharedSecretRef = useRef<CryptoKey | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
     const videoInputRef = useRef<HTMLInputElement>(null);
 
-    // --- EXISTING HELPERS ---
-    const encryptSalt = (raw: string) => CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
-    const decryptSalt = (enc: string) => {
-        if (!enc) return null;
+    // Initialize IndexedDB and check for existing keys
+    useEffect(() => {
+        const initApp = async () => {
+            try {
+                await secureDB.init();
+                
+                if (!pb.authStore.isValid) {
+                    window.location.href = "/login";
+                    return;
+                }
+
+                const user = pb.authStore.model;
+                setMyUser(user);
+
+                // Check if user has existing key pair in IndexedDB
+                const storedKeyPair = await secureDB.getKeyPair(user.id);
+                
+                if (storedKeyPair) {
+                    // Import existing keys
+                    const publicKey = await ECDHCrypto.importPublicKey(storedKeyPair.publicKey);
+                    const privateKey = await ECDHCrypto.importPrivateKey(storedKeyPair.privateKey);
+                    setMyKeyPair({ publicKey, privateKey });
+                    setInitializingKeys(false);
+                } else {
+                    // Check if backup exists on server
+                    try {
+                        const userRecord = await pb.collection('users').getOne(user.id);
+                        if (userRecord.encrypted_private_key) {
+                            // Has backup, show restore modal
+                            setShowRestoreModal(true);
+                            setInitializingKeys(false);
+                        } else {
+                            // No keys at all, show setup modal
+                            setShowBackupModal(true);
+                            setInitializingKeys(false);
+                        }
+                    } catch (err) {
+                        console.error("Error checking backup:", err);
+                        setShowBackupModal(true);
+                        setInitializingKeys(false);
+                    }
+                }
+
+                loadFriends();
+                if (typeof window !== "undefined" && "Notification" in window) {
+                    Notification.requestPermission();
+                }
+            } catch (err) {
+                console.error("Initialization error:", err);
+                alert("Gagal menginisialisasi aplikasi");
+            }
+        };
+
+        initApp();
+    }, []);
+
+    // Setup new backup
+    const handleSetupBackup = async (passphrase: string) => {
         try {
-            const bytes = CryptoJS.AES.decrypt(enc, INTERNAL_APP_KEY);
-            return bytes.toString(CryptoJS.enc.Utf8) || null; 
-        } catch (e) { return null; }
+            // Generate new ECDH key pair
+            const keyPair = await ECDHCrypto.generateKeyPair();
+            
+            // Export keys
+            const publicKeyJwk = await ECDHCrypto.exportPublicKey(keyPair.publicKey);
+            const privateKeyJwk = await ECDHCrypto.exportPrivateKey(keyPair.privateKey);
+            
+            // Encrypt private key with passphrase
+            const encryptedPrivateKey = await ECDHCrypto.encryptPrivateKeyWithPassphrase(
+                privateKeyJwk,
+                passphrase
+            );
+            
+            // Save to IndexedDB
+            await secureDB.saveKeyPair(myUser.id, publicKeyJwk, privateKeyJwk);
+            
+            // Upload to PocketBase
+            await pb.collection('users').update(myUser.id, {
+                public_key: JSON.stringify(publicKeyJwk),
+                encrypted_private_key: encryptedPrivateKey
+            });
+            
+            setMyKeyPair(keyPair);
+            setShowBackupModal(false);
+            alert("✅ Backup berhasil dibuat!");
+        } catch (err) {
+            console.error("Backup setup error:", err);
+            alert("Gagal membuat backup: " + (err as Error).message);
+        }
     };
 
-    const generateChatKey = (id1: string, id2: string, salt: string) => {
-        const combined = [id1, id2].sort().join("");
-        return CryptoJS.SHA256(combined + salt + INTERNAL_APP_KEY).toString();
-    };
-
-    // --- CACHE LOGIC ---
-    const encryptCache = (data: any) => {
-        try { return CryptoJS.AES.encrypt(JSON.stringify(data), INTERNAL_APP_KEY).toString(); }
-        catch (e) { return null; }
-    };
-
-    const decryptCache = (encrypted: string) => {
+    // Restore from backup
+    const handleRestoreBackup = async (passphrase: string): Promise<boolean> => {
         try {
-            const bytes = CryptoJS.AES.decrypt(encrypted, INTERNAL_APP_KEY);
-            const jsonStr = bytes.toString(CryptoJS.enc.Utf8);
-            return jsonStr ? JSON.parse(jsonStr) : null;
-        } catch (e) { return null; }
+            // Fetch encrypted key from server
+            const userRecord = await pb.collection('users').getOne(myUser.id);
+            if (!userRecord.encrypted_private_key || !userRecord.public_key) {
+                return false;
+            }
+
+            // Decrypt private key
+            const privateKeyJwk = await ECDHCrypto.decryptPrivateKeyWithPassphrase(
+                userRecord.encrypted_private_key,
+                passphrase
+            );
+
+            const publicKeyJwk = JSON.parse(userRecord.public_key);
+
+            // Import keys
+            const publicKey = await ECDHCrypto.importPublicKey(publicKeyJwk);
+            const privateKey = await ECDHCrypto.importPrivateKey(privateKeyJwk);
+
+            // Save to IndexedDB
+            await secureDB.saveKeyPair(myUser.id, publicKeyJwk, privateKeyJwk);
+
+            setMyKeyPair({ publicKey, privateKey });
+            setShowRestoreModal(false);
+            alert("✅ Kunci berhasil dipulihkan!");
+            return true;
+        } catch (err) {
+            console.error("Restore error:", err);
+            return false;
+        }
     };
 
-    const saveMessagesToCache = (userId: string, friendId: string, messages: any[]) => {
-        const cacheKey = `bitlab_chat_${userId}_${friendId}`;
-        const encrypted = encryptCache({ messages, timestamp: Date.now() });
-        if (encrypted) localStorage.setItem(cacheKey, encrypted);
+    // Skip restore and create new keys
+    const handleSkipRestore = async () => {
+        setShowRestoreModal(false);
+        setShowBackupModal(true);
     };
 
-    const loadMessagesFromCache = (userId: string, friendId: string) => {
-        const encrypted = localStorage.getItem(`bitlab_chat_${userId}_${friendId}`);
-        if (!encrypted) return null;
-        const cacheData = decryptCache(encrypted);
-        if (!cacheData || Date.now() - cacheData.timestamp > 7 * 24 * 60 * 60 * 1000) return null;
-        return cacheData.messages;
+    // Derive shared secret with friend
+    const deriveSharedSecretWithFriend = async (friendId: string): Promise<CryptoKey | null> => {
+        try {
+            if (!myKeyPair) return null;
+
+            // Check cache first
+            const cacheId = [myUser.id, friendId].sort().join('_');
+            const cached = await secureDB.getSharedSecret(cacheId);
+            if (cached) {
+                // Import cached key
+                const keyData = JSON.parse(cached);
+                return window.crypto.subtle.importKey(
+                    "jwk",
+                    keyData,
+                    { name: "AES-GCM", length: 256 },
+                    true,
+                    ["encrypt", "decrypt"]
+                );
+            }
+
+            // Fetch friend's public key
+            const friendRecord = await pb.collection('users').getOne(friendId);
+            if (!friendRecord.public_key) {
+                console.error("Friend doesn't have public key");
+                return null;
+            }
+
+            const friendPublicKeyJwk = JSON.parse(friendRecord.public_key);
+            const friendPublicKey = await ECDHCrypto.importPublicKey(friendPublicKeyJwk);
+
+            // Derive shared secret
+            const sharedSecret = await ECDHCrypto.deriveSharedSecret(
+                myKeyPair.privateKey,
+                friendPublicKey
+            );
+
+            // Cache the shared secret
+            const exportedSecret = await window.crypto.subtle.exportKey("jwk", sharedSecret);
+            await secureDB.saveSharedSecret(cacheId, JSON.stringify(exportedSecret));
+
+            return sharedSecret;
+        } catch (err) {
+            console.error("Error deriving shared secret:", err);
+            return null;
+        }
     };
 
-    const clearChatCache = (userId: string, friendId?: string) => {
-        if (friendId) localStorage.removeItem(`bitlab_chat_${userId}_${friendId}`);
-        else Object.keys(localStorage).forEach(k => k.startsWith(`bitlab_chat_${userId}_`) && localStorage.removeItem(k));
-    };
-
-    // --- LOGIC FUNCTIONS ---
+    // Load friends
     const loadFriends = async () => {
         try {
             const userId = pb.authStore.model?.id;
@@ -508,7 +1125,9 @@ export default function ChatPage() {
             setFriends(records.filter(r => r.status === 'accepted'));
             setRequests(records.filter(r => r.status === 'pending' && r.friend === userId));
             await loadUnreadCounts(records.filter(r => r.status === 'accepted'));
-        } catch (err) { console.error(err); }
+        } catch (err) {
+            console.error(err);
+        }
     };
 
     const loadUnreadCounts = async (friendRecords: any[]) => {
@@ -519,35 +1138,44 @@ export default function ChatPage() {
                 const friendData = f.user === myId ? f.expand?.friend : f.expand?.user;
                 const lastRead = f.user === myId ? f.last_read_user : f.last_read_friend;
                 if (friendData?.id) {
-                    const filter = lastRead ? `sender="${friendData.id}" && receiver="${myId}" && created>"${lastRead}"` : `sender="${friendData.id}" && receiver="${myId}"`;
+                    const filter = lastRead 
+                        ? `sender="${friendData.id}" && receiver="${myId}" && created>"${lastRead}"` 
+                        : `sender="${friendData.id}" && receiver="${myId}"`;
                     const result = await pb.collection('messages').getList(1, 1, { filter, fields: 'id' });
                     if (result.totalItems > 0) newCounts[friendData.id] = result.totalItems;
                 }
             }
             setUnreadCounts(newCounts);
-        } catch (err) { console.error(err); }
+        } catch (err) {
+            console.error(err);
+        }
     };
 
     const respondRequest = async (id: string, action: 'accepted' | 'reject') => {
         try {
             if (action === 'accepted') {
-                const salt = Math.random().toString(36).substring(2, 8).toUpperCase();
-                await pb.collection('friends').update(id, { status: "accepted", chat_salt: encryptSalt(salt) });
-            } else await pb.collection('friends').delete(id);
+                await pb.collection('friends').update(id, { status: "accepted" });
+            } else {
+                await pb.collection('friends').delete(id);
+            }
             loadFriends();
-        } catch (err) { console.error(err); }
+        } catch (err) {
+            console.error(err);
+        }
     };
 
     const triggerLocalNotification = (name: string) => {
-        if (Notification.permission === "granted") new Notification("Pesan Baru", { body: `Pesan rahasia dari ${name}`, icon: "/icon.png" });
+        if (Notification.permission === "granted") {
+            new Notification("Pesan Baru", { 
+                body: `Pesan dari ${name}`, 
+                icon: "/icon.png" 
+            });
+        }
     };
 
-    // --- REALTIME ENGINE ---
+    // Realtime subscriptions
     useEffect(() => {
-        if (!pb.authStore.isValid) { window.location.href = "/login"; return; }
-        setMyUser(pb.authStore.model);
-        loadFriends();
-        if (typeof window !== "undefined" && "Notification" in window) Notification.requestPermission();
+        if (!myUser) return;
 
         pb.collection('friends').subscribe('*', () => loadFriends());
         pb.collection('messages').subscribe('*', async (e) => {
@@ -556,22 +1184,31 @@ export default function ChatPage() {
                 const myId = pb.authStore.model?.id;
                 if (!myId) return;
 
-                const isRelevant = activeChat && ((msg.sender === myId && msg.receiver === activeChat.id) || (msg.sender === activeChat.id && msg.receiver === myId));
+                const isRelevant = activeChat && (
+                    (msg.sender === myId && msg.receiver === activeChat.id) ||
+                    (msg.sender === activeChat.id && msg.receiver === myId)
+                );
 
                 if (isRelevant) {
                     setMessages(prev => {
                         const updated = [...prev, msg];
-                        saveMessagesToCache(myId, activeChat.id, updated);
+                        secureDB.saveMessages(myId, activeChat.id, updated);
                         return updated;
                     });
                 }
 
                 if (msg.receiver === myId && (!activeChat || msg.sender !== activeChat.id)) {
-                    setUnreadCounts(prev => ({ ...prev, [msg.sender]: (prev[msg.sender] || 0) + 1 }));
+                    setUnreadCounts(prev => ({ 
+                        ...prev, 
+                        [msg.sender]: (prev[msg.sender] || 0) + 1 
+                    }));
+                    
                     try {
                         const sender = await pb.collection('users').getOne(msg.sender);
                         triggerLocalNotification(sender.name || sender.username || "Seseorang");
-                    } catch { triggerLocalNotification("Seseorang"); }
+                    } catch {
+                        triggerLocalNotification("Seseorang");
+                    }
                 }
             }
         });
@@ -580,39 +1217,63 @@ export default function ChatPage() {
             pb.collection('friends').unsubscribe();
             pb.collection('messages').unsubscribe();
         };
-    }, [activeChat]);
+    }, [activeChat, myUser]);
 
+    // Auto-scroll chat
     useEffect(() => {
-        if (chatBoxRef.current) chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+        if (chatBoxRef.current) {
+            chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+        }
     }, [messages]);
 
+    // Select chat
     const selectChat = async (friendRecord: any) => {
-        if (!myUser?.id) return;
+        if (!myUser?.id || !myKeyPair) return;
+
         setMessages([]);
         setLoadingMessages(true);
         setLoadError(null);
-        
-        if (loadingTimeoutRef.current) clearTimeout(loadingTimeoutRef.current);
-        loadingTimeoutRef.current = setTimeout(() => loadingMessages && setIsLoadingTimeout(true), 5000);
-        
-        const friendData = friendRecord.user === myUser.id ? friendRecord.expand.friend : friendRecord.expand.user;
-        const salt = decryptSalt(friendRecord.chat_salt) || "fallback";
-        const key = generateChatKey(myUser.id, friendData.id, salt);
-        currentChatKeyRef.current = key;
-        
-        setActiveChat({ ...friendData, salt, friendRecordId: friendRecord.id });
-        setUnreadCounts(prev => { const n = { ...prev }; delete n[friendData.id]; return n; });
 
+        const friendData = friendRecord.user === myUser.id 
+            ? friendRecord.expand.friend 
+            : friendRecord.expand.user;
+
+        // Derive shared secret
+        const sharedSecret = await deriveSharedSecretWithFriend(friendData.id);
+        if (!sharedSecret) {
+            setLoadError("Gagal membuat kunci enkripsi dengan teman");
+            setLoadingMessages(false);
+            return;
+        }
+
+        currentSharedSecretRef.current = sharedSecret;
+        setSharedSecrets(prev => new Map(prev).set(friendData.id, sharedSecret));
+
+        setActiveChat({ ...friendData, friendRecordId: friendRecord.id });
+        setUnreadCounts(prev => {
+            const n = { ...prev };
+            delete n[friendData.id];
+            return n;
+        });
+
+        // Mark as read
         try {
             const isUserFirst = friendRecord.user === myUser.id;
             await pb.collection('friends').update(friendRecord.id, {
                 [isUserFirst ? 'last_read_user' : 'last_read_friend']: new Date().toISOString()
             });
-        } catch (err) { console.error(err); }
-        
-        const cached = loadMessagesFromCache(myUser.id, friendData.id);
-        if (cached) { setMessages(cached); setLoadingMessages(false); }
-        
+        } catch (err) {
+            console.error(err);
+        }
+
+        // Load from cache first
+        const cached = await secureDB.getMessages(myUser.id, friendData.id);
+        if (cached) {
+            setMessages(cached);
+            setLoadingMessages(false);
+        }
+
+        // Fetch fresh messages
         try {
             const res = await pb.collection('messages').getList(1, 50, {
                 filter: `(sender="${myUser.id}" && receiver="${friendData.id}") || (sender="${friendData.id}" && receiver="${myUser.id}")`,
@@ -621,44 +1282,52 @@ export default function ChatPage() {
             });
             const fresh = res.items.reverse();
             setMessages(fresh);
-            saveMessagesToCache(myUser.id, friendData.id, fresh);
+            await secureDB.saveMessages(myUser.id, friendData.id, fresh);
         } catch (err: any) {
-            if (!err?.isAbort) setLoadError(err?.message || 'Failed to load');
+            if (!err?.isAbort) {
+                setLoadError(err?.message || 'Failed to load');
+            }
         } finally {
             setLoadingMessages(false);
-            setIsLoadingTimeout(false);
         }
+
         if (window.innerWidth < 768) setIsSidebarOpen(false);
     };
 
+    // Send message
     const sendMessage = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!inputText.trim() || !activeChat) return;
+        if (!inputText.trim() || !activeChat || !currentSharedSecretRef.current) return;
+
         try {
-            const encrypted = await encryptGCM(inputText.trim(), currentChatKeyRef.current);
-            await pb.collection('messages').create({ 
-                sender: myUser.id, 
-                receiver: activeChat.id, 
+            const encrypted = await ECDHCrypto.encryptMessage(
+                inputText.trim(),
+                currentSharedSecretRef.current
+            );
+
+            await pb.collection('messages').create({
+                sender: myUser.id,
+                receiver: activeChat.id,
                 text: encrypted,
                 type: 'text'
             });
+
             setInputText("");
         } catch (err) {
             console.error("Encryption failed", err);
+            alert("Gagal mengirim pesan");
         }
     };
 
-    // --- FILE HANDLING WITH PREVIEW ---
+    // File handling
     const handleFileSelect = (file: File, type: MessageType) => {
         if (!file) return;
-        
-        // Validasi ukuran file (max 10MB)
+
         if (file.size > 10 * 1024 * 1024) {
             alert("File terlalu besar. Maksimal 10MB");
             return;
         }
 
-        // Create preview URL for images, videos, and audio
         let previewUrl: string | undefined;
         if (type === 'image' || type === 'video' || type === 'audio') {
             previewUrl = URL.createObjectURL(file);
@@ -668,61 +1337,63 @@ export default function ChatPage() {
     };
 
     const confirmSendFile = async () => {
-        if (!filePreview || !activeChat) return;
-        
-        const currentPreview = filePreview; // Store reference before clearing
-        
+        if (!filePreview || !activeChat || !currentSharedSecretRef.current) return;
+
+        const currentPreview = filePreview;
+
         try {
             setUploadingFile(true);
-            setFilePreview(null); // Close preview
-            
+            setFilePreview(null);
+
             const { file, type } = currentPreview;
-            
-            // Read file as ArrayBuffer
             const arrayBuffer = await file.arrayBuffer();
-            
-            // Encrypt file content
-            const key = await getCryptoKey(currentChatKeyRef.current);
+
+            // Encrypt file
             const iv = window.crypto.getRandomValues(new Uint8Array(12));
-            const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, arrayBuffer);
-            
-            // Combine IV and encrypted data efficiently
+            const encrypted = await window.crypto.subtle.encrypt(
+                { name: "AES-GCM", iv },
+                currentSharedSecretRef.current,
+                arrayBuffer
+            );
+
             const encryptedArray = new Uint8Array(iv.length + encrypted.byteLength);
             encryptedArray.set(iv);
             encryptedArray.set(new Uint8Array(encrypted), iv.length);
-            
-            // Create blob directly from array (no base64 conversion)
+
             const encryptedBlob = new Blob([encryptedArray], { type: 'application/octet-stream' });
-            const encryptedFile = new File([encryptedBlob], `encrypted_${file.name}`, { type: 'application/octet-stream' });
-            
-            // Prepare metadata
+            const encryptedFile = new File(
+                [encryptedBlob],
+                `encrypted_${file.name}`,
+                { type: 'application/octet-stream' }
+            );
+
+            // Encrypt metadata
             const metadata: FileMetadata = {
                 filename: file.name,
                 mimeType: file.type,
                 size: file.size
             };
-            
-            // Encrypt metadata
-            const encryptedMetadata = await encryptGCM(JSON.stringify(metadata), currentChatKeyRef.current);
-            
-            // Create FormData
+
+            const encryptedMetadata = await ECDHCrypto.encryptMessage(
+                JSON.stringify(metadata),
+                currentSharedSecretRef.current
+            );
+
+            // Send to PocketBase
             const formData = new FormData();
             formData.append('sender', myUser.id);
             formData.append('receiver', activeChat.id);
             formData.append('text', encryptedMetadata);
             formData.append('type', type);
             formData.append('file', encryptedFile);
-            
-            // Send to PocketBase
+
             await pb.collection('messages').create(formData);
-            
             setShowAttachMenu(false);
         } catch (err) {
             console.error("File upload failed:", err);
             alert("Gagal mengirim file: " + (err as Error).message);
         } finally {
             setUploadingFile(false);
-            // Cleanup preview URL
             if (currentPreview.previewUrl) {
                 URL.revokeObjectURL(currentPreview.previewUrl);
             }
@@ -741,24 +1412,76 @@ export default function ChatPage() {
         handleFileSelect(file, 'audio');
     };
 
+    // Add friend
     const addFriend = async (e: React.FormEvent) => {
         e.preventDefault();
         const input = searchId.trim();
-        if (!input || input === myUser.id) return alert("ID tidak valid.");
+        if (!input || input === myUser.id) {
+            alert("ID tidak valid.");
+            return;
+        }
+
         try {
-            const userList = await pb.collection('users').getList(1, 1, { filter: `id = "${input}" || email = "${input}"` });
-            if (userList.items.length === 0) return alert("User tidak ditemukan.");
-            await pb.collection('friends').create({ user: myUser.id, friend: userList.items[0].id, status: 'pending' });
+            const userList = await pb.collection('users').getList(1, 1, {
+                filter: `id = "${input}" || email = "${input}"`
+            });
+
+            if (userList.items.length === 0) {
+                alert("User tidak ditemukan.");
+                return;
+            }
+
+            await pb.collection('friends').create({
+                user: myUser.id,
+                friend: userList.items[0].id,
+                status: 'pending'
+            });
+
             alert("Permintaan terkirim!");
             setSearchId("");
-        } catch (err) { alert("Gagal kirim permintaan."); }
+        } catch (err) {
+            alert("Gagal kirim permintaan.");
+        }
     };
 
-    if (!myUser) return <div className="h-screen flex items-center justify-center bg-background">Initializing...</div>;
+    // Clear cache
+    const handleClearCache = async () => {
+        if (confirm('Hapus semua cache pesan?')) {
+            try {
+                await secureDB.clearAllMessages(myUser.id);
+                alert("Cache berhasil dihapus");
+            } catch (err) {
+                console.error(err);
+                alert("Gagal menghapus cache");
+            }
+        }
+    };
+
+    if (!myUser || initializingKeys) {
+        return (
+            <div className="h-screen flex items-center justify-center bg-background">
+                <div className="text-center">
+                    <div className="w-16 h-16 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                    <p className="text-sm text-muted-foreground">Menginisialisasi...</p>
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="flex h-screen bg-background text-foreground overflow-hidden border-t border-border">
-            {/* File Preview Modal */}
+            {/* Modals */}
+            {showBackupModal && (
+                <KeyBackupModal onSetupComplete={handleSetupBackup} />
+            )}
+
+            {showRestoreModal && (
+                <KeyRestoreModal 
+                    onRestore={handleRestoreBackup}
+                    onSkip={handleSkipRestore}
+                />
+            )}
+
             {filePreview && (
                 <FilePreviewModal
                     preview={filePreview}
@@ -776,7 +1499,7 @@ export default function ChatPage() {
                 onChange={(e) => {
                     const file = e.target.files?.[0];
                     if (file) handleFileSelect(file, 'image');
-                    e.target.value = ''; // Reset input
+                    e.target.value = '';
                 }}
             />
             <input
@@ -787,7 +1510,7 @@ export default function ChatPage() {
                 onChange={(e) => {
                     const file = e.target.files?.[0];
                     if (file) handleFileSelect(file, 'video');
-                    e.target.value = ''; // Reset input
+                    e.target.value = '';
                 }}
             />
             <input
@@ -797,17 +1520,30 @@ export default function ChatPage() {
                 onChange={(e) => {
                     const file = e.target.files?.[0];
                     if (file) handleFileSelect(file, 'file');
-                    e.target.value = ''; // Reset input
+                    e.target.value = '';
                 }}
             />
 
-            <div className={`fixed inset-0 bg-black/50 z-40 md:hidden ${isSidebarOpen ? 'block' : 'hidden'}`} onClick={() => setIsSidebarOpen(false)} />
+            {/* Sidebar overlay */}
+            <div 
+                className={`fixed inset-0 bg-black/50 z-40 md:hidden ${isSidebarOpen ? 'block' : 'hidden'}`} 
+                onClick={() => setIsSidebarOpen(false)} 
+            />
 
+            {/* Sidebar */}
             <aside className={`fixed md:relative inset-y-0 left-0 w-80 bg-card border-r border-border flex flex-col z-50 transition-transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
                 <div className="p-4 border-b border-border flex items-center justify-between">
-                    <h1 className="text-sm font-bold uppercase tracking-tighter">Bitlab Chat</h1>
-                    <button onClick={() => setShowNoti(!showNoti)} className="relative p-2 hover:bg-accent rounded-md">
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>
+                    <div>
+                        <h1 className="text-sm font-bold uppercase tracking-tighter">Bitlab Chat</h1>
+                        <p className="text-[9px] text-emerald-500 font-bold">ECDH ENCRYPTED</p>
+                    </div>
+                    <button 
+                        onClick={() => setShowNoti(!showNoti)} 
+                        className="relative p-2 hover:bg-accent rounded-md"
+                    >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                        </svg>
                         {(requests.length > 0 || Object.values(unreadCounts).reduce((a,b)=>a+b,0) > 0) && (
                             <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[10px] font-bold px-1 animate-pulse">
                                 {requests.length + Object.values(unreadCounts).reduce((a,b)=>a+b,0)}
@@ -819,100 +1555,186 @@ export default function ChatPage() {
                 {showNoti && (
                     <div className="absolute top-14 left-4 right-4 bg-popover border border-border shadow-xl rounded-lg z-[60] py-2">
                         <p className="px-4 py-1 text-[10px] font-bold text-muted-foreground uppercase">Requests</p>
-                        {requests.length === 0 ? <p className="px-4 py-3 text-xs">No pending requests</p> : 
+                        {requests.length === 0 ? (
+                            <p className="px-4 py-3 text-xs">No pending requests</p>
+                        ) : (
                             requests.map(req => (
                                 <div key={req.id} className="px-4 py-2 flex items-center justify-between border-b last:border-0">
-                                    <span className="text-xs truncate font-medium">{req.expand?.user?.name || req.expand?.user?.email}</span>
+                                    <span className="text-xs truncate font-medium">
+                                        {req.expand?.user?.name || req.expand?.user?.email}
+                                    </span>
                                     <div className="flex gap-1">
-                                        <button onClick={() => respondRequest(req.id, 'accepted')} className="px-2 py-1 bg-primary text-white text-[10px] rounded">Accept</button>
-                                        <button onClick={() => respondRequest(req.id, 'reject')} className="px-2 py-1 bg-destructive text-white text-[10px] rounded">Reject</button>
+                                        <button 
+                                            onClick={() => respondRequest(req.id, 'accepted')} 
+                                            className="px-2 py-1 bg-primary text-white text-[10px] rounded"
+                                        >
+                                            Accept
+                                        </button>
+                                        <button 
+                                            onClick={() => respondRequest(req.id, 'reject')} 
+                                            className="px-2 py-1 bg-destructive text-white text-[10px] rounded"
+                                        >
+                                            Reject
+                                        </button>
                                     </div>
                                 </div>
                             ))
-                        }
+                        )}
                     </div>
                 )}
 
                 <div className="p-4">
                     <form onSubmit={addFriend} className="flex gap-2">
-                        <input value={searchId} onChange={(e) => setSearchId(e.target.value)} placeholder="User ID / Email" className="flex-1 h-9 bg-transparent border border-input rounded-md px-3 text-xs outline-none" />
-                        <button type="submit" className="h-9 px-3 bg-secondary text-secondary-foreground rounded-md text-[10px] font-bold">ADD</button>
+                        <input 
+                            value={searchId} 
+                            onChange={(e) => setSearchId(e.target.value)} 
+                            placeholder="User ID / Email" 
+                            className="flex-1 h-9 bg-transparent border border-input rounded-md px-3 text-xs outline-none" 
+                        />
+                        <button 
+                            type="submit" 
+                            className="h-9 px-3 bg-secondary text-secondary-foreground rounded-md text-[10px] font-bold"
+                        >
+                            ADD
+                        </button>
                     </form>
                 </div>
 
                 <div className="flex-1 overflow-y-auto px-2 space-y-1">
-                    <p className="px-2 text-[10px] font-bold text-muted-foreground uppercase mb-2">Direct Messages</p>
+                    <p className="px-2 text-[10px] font-bold text-muted-foreground uppercase mb-2">
+                        Direct Messages
+                    </p>
                     {friends.map(f => {
                         const friendData = f.user === myUser.id ? f.expand?.friend : f.expand?.user;
                         const unread = unreadCounts[friendData?.id] || 0;
                         return (
-                            <button key={f.id} onClick={() => selectChat(f)} className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent' : 'hover:bg-accent/40'}`}>
+                            <button 
+                                key={f.id} 
+                                onClick={() => selectChat(f)} 
+                                className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent' : 'hover:bg-accent/40'}`}
+                            >
                                 <div className="relative">
-                                    <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">{(friendData?.name || 'U')[0].toUpperCase()}</div>
-                                    {unread > 0 && <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] font-bold px-1 border-2 border-card">{unread}</span>}
+                                    <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">
+                                        {(friendData?.name || 'U')[0].toUpperCase()}
+                                    </div>
+                                    {unread > 0 && (
+                                        <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] font-bold px-1 border-2 border-card">
+                                            {unread}
+                                        </span>
+                                    )}
                                 </div>
                                 <div className="text-left truncate flex-1">
-                                    <div className="text-sm font-semibold truncate">{friendData?.name || friendData?.email}</div>
-                                    <p className={`text-[10px] font-bold ${unread > 0 ? 'text-red-500' : 'text-emerald-500'}`}>{unread > 0 ? `${unread} pesan baru` : 'Secured Session'}</p>
+                                    <div className="text-sm font-semibold truncate">
+                                        {friendData?.name || friendData?.email}
+                                    </div>
+                                    <p className={`text-[10px] font-bold ${unread > 0 ? 'text-red-500' : 'text-emerald-500'}`}>
+                                        {unread > 0 ? `${unread} pesan baru` : 'E2EE Active'}
+                                    </p>
                                 </div>
                             </button>
                         );
                     })}
                 </div>
-                
+
                 <div className="p-4 border-t border-border bg-muted/20 space-y-2">
-                    <button onClick={() => window.location.href = "/profile"} className="w-full flex items-center gap-3 p-2 rounded-md hover:bg-accent group">
-                        <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-[10px] font-bold text-primary-foreground">{(myUser.name || 'M')[0].toUpperCase()}</div>
-                        <div className="flex-1 text-left truncate"><p className="text-xs font-bold truncate">{myUser.name || myUser.username}</p></div>
+                    <button 
+                        onClick={() => window.location.href = "/profile"} 
+                        className="w-full flex items-center gap-3 p-2 rounded-md hover:bg-accent group"
+                    >
+                        <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-[10px] font-bold text-primary-foreground">
+                            {(myUser.name || 'M')[0].toUpperCase()}
+                        </div>
+                        <div className="flex-1 text-left truncate">
+                            <p className="text-xs font-bold truncate">{myUser.name || myUser.username}</p>
+                        </div>
                     </button>
-                    <button onClick={() => { if(confirm('Clear cache?')) clearChatCache(myUser.id); }} className="w-full flex items-center gap-2 p-2 text-xs text-muted-foreground hover:text-foreground">
-                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                    <button 
+                        onClick={handleClearCache} 
+                        className="w-full flex items-center gap-2 p-2 text-xs text-muted-foreground hover:text-foreground"
+                    >
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
                         <span>Clear Cache</span>
                     </button>
                 </div>
             </aside>
 
+            {/* Main chat area */}
             <main className="flex-1 flex flex-col bg-background">
                 <header className="h-14 border-b border-border flex items-center px-4 justify-between bg-background/95 backdrop-blur sticky top-0 z-30">
                     <div className="flex items-center gap-3">
-                        <button onClick={() => setIsSidebarOpen(true)} className="md:hidden p-2 -ml-2 hover:bg-accent rounded-md"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" /></svg></button>
+                        <button 
+                            onClick={() => setIsSidebarOpen(true)} 
+                            className="md:hidden p-2 -ml-2 hover:bg-accent rounded-md"
+                        >
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" />
+                            </svg>
+                        </button>
                         {activeChat && (
                             <div className="flex items-center gap-2">
-                                <div className="w-8 h-8 rounded-full bg-secondary flex items-center justify-center text-[10px] font-bold border border-border shadow-sm">{(activeChat.name || 'U')[0].toUpperCase()}</div>
-                                <div><h2 className="text-sm font-bold leading-none">{activeChat.name || activeChat.email}</h2><p className="text-[10px] text-emerald-500 font-bold mt-0.5">AES-GCM PROTECTED</p></div>
+                                <div className="w-8 h-8 rounded-full bg-secondary flex items-center justify-center text-[10px] font-bold border border-border shadow-sm">
+                                    {(activeChat.name || 'U')[0].toUpperCase()}
+                                </div>
+                                <div>
+                                    <h2 className="text-sm font-bold leading-none">
+                                        {activeChat.name || activeChat.email}
+                                    </h2>
+                                    <p className="text-[10px] text-emerald-500 font-bold mt-0.5">
+                                        ECDH E2EE
+                                    </p>
+                                </div>
                             </div>
                         )}
                     </div>
                 </header>
 
                 {!activeChat ? (
-                    <div className="flex-1 flex flex-col items-center justify-center space-y-3 opacity-30"><p className="text-[10px] font-bold uppercase tracking-widest">Select a session</p></div>
+                    <div className="flex-1 flex flex-col items-center justify-center space-y-3 opacity-30">
+                        <svg className="w-16 h-16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                        </svg>
+                        <p className="text-[10px] font-bold uppercase tracking-widest">Select a chat</p>
+                    </div>
                 ) : (
                     <>
                         <div ref={chatBoxRef} className="flex-1 overflow-y-auto p-4 space-y-4">
                             {loadingMessages ? (
-                                <div className="flex items-center justify-center h-full"><div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin"></div></div>
+                                <div className="flex items-center justify-center h-full">
+                                    <div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin"></div>
+                                </div>
                             ) : loadError ? (
-                                <div className="flex items-center justify-center h-full text-center"><p className="text-destructive text-sm">{loadError}</p></div>
+                                <div className="flex items-center justify-center h-full text-center">
+                                    <p className="text-destructive text-sm">{loadError}</p>
+                                </div>
                             ) : (
                                 messages.map((m, idx) => (
-                                    <div key={m.id || idx} className={`flex ${m.sender === myUser.id ? 'justify-end' : 'justify-start'}`}>
+                                    <div 
+                                        key={m.id || idx} 
+                                        className={`flex ${m.sender === myUser.id ? 'justify-end' : 'justify-start'}`}
+                                    >
                                         <div className={`max-w-[75%] p-3 rounded-2xl text-sm ${m.sender === myUser.id ? 'bg-primary text-primary-foreground rounded-tr-none' : 'bg-muted rounded-tl-none'}`}>
                                             {(!m.type || m.type === 'text') ? (
-                                                <DecryptedMessage text={m.text} secretKey={currentChatKeyRef.current} />
+                                                <DecryptedMessage 
+                                                    text={m.text} 
+                                                    sharedSecret={currentSharedSecretRef.current}
+                                                />
                                             ) : (
                                                 <DecryptedFile 
                                                     message={m}
-                                                    secretKey={currentChatKeyRef.current}
+                                                    sharedSecret={currentSharedSecretRef.current}
                                                 />
                                             )}
-                                            <p className="text-[8px] opacity-50 mt-1 text-right">{new Date(m.created).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</p>
+                                            <p className="text-[8px] opacity-50 mt-1 text-right">
+                                                {new Date(m.created).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}
+                                            </p>
                                         </div>
                                     </div>
                                 ))
                             )}
                         </div>
-                        
+
                         <form onSubmit={sendMessage} className="p-4 border-t border-border bg-background">
                             {uploadingFile && (
                                 <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
@@ -920,7 +1742,7 @@ export default function ChatPage() {
                                     <span>Mengenkripsi dan mengirim...</span>
                                 </div>
                             )}
-                            
+
                             <div className="flex gap-2 items-center">
                                 {/* Attach button */}
                                 <div className="relative">
@@ -934,7 +1756,7 @@ export default function ChatPage() {
                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
                                         </svg>
                                     </button>
-                                    
+
                                     {showAttachMenu && (
                                         <div className="absolute bottom-full left-0 mb-2 bg-popover border border-border rounded-lg shadow-xl p-2 space-y-1 min-w-[160px]">
                                             <button
@@ -973,19 +1795,19 @@ export default function ChatPage() {
 
                                 {/* Voice recorder */}
                                 <VoiceRecorder onRecord={handleVoiceRecord} />
-                                
+
                                 {/* Text input */}
-                                <input 
-                                    value={inputText} 
-                                    onChange={(e) => setInputText(e.target.value)} 
-                                    placeholder="Type a message..." 
-                                    className="flex-1 h-10 bg-muted rounded-full px-4 text-sm outline-none focus:ring-2 focus:ring-primary" 
+                                <input
+                                    value={inputText}
+                                    onChange={(e) => setInputText(e.target.value)}
+                                    placeholder="Type a message..."
+                                    className="flex-1 h-10 bg-muted rounded-full px-4 text-sm outline-none focus:ring-2 focus:ring-primary"
                                     disabled={uploadingFile}
                                 />
-                                
+
                                 {/* Send button */}
-                                <button 
-                                    type="submit" 
+                                <button
+                                    type="submit"
                                     className="w-10 h-10 bg-primary text-primary-foreground rounded-full flex items-center justify-center active:scale-95 transition-transform disabled:opacity-50"
                                     disabled={uploadingFile}
                                 >

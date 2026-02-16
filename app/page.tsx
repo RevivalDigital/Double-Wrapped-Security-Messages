@@ -20,6 +20,12 @@ interface FileMetadata {
     size: number;
 }
 
+interface FilePreview {
+    file: File;
+    type: MessageType;
+    previewUrl?: string;
+}
+
 // --- GCM HELPER FUNCTIONS ---
 async function getCryptoKey(rawKey: string) {
     const enc = new TextEncoder();
@@ -219,8 +225,132 @@ function DecryptedFile({
     );
 }
 
+// --- FILE PREVIEW MODAL COMPONENT ---
+function FilePreviewModal({ 
+    preview, 
+    onSend, 
+    onCancel 
+}: { 
+    preview: FilePreview; 
+    onSend: () => void; 
+    onCancel: () => void;
+}) {
+    return (
+        <div className="fixed inset-0 bg-black/80 z-[100] flex items-center justify-center p-4">
+            <div className="bg-card border border-border rounded-lg max-w-2xl w-full max-h-[90vh] overflow-hidden flex flex-col">
+                {/* Header */}
+                <div className="p-4 border-b border-border flex items-center justify-between">
+                    <h3 className="font-bold text-sm">Preview File</h3>
+                    <button onClick={onCancel} className="p-1 hover:bg-accent rounded">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+
+                {/* Preview Content */}
+                <div className="flex-1 overflow-y-auto p-4 bg-muted/20">
+                    <div className="flex flex-col items-center justify-center space-y-4">
+                        {preview.type === 'image' && preview.previewUrl && (
+                            <img 
+                                src={preview.previewUrl} 
+                                alt={preview.file.name} 
+                                className="max-w-full max-h-[50vh] rounded-lg border border-border"
+                            />
+                        )}
+                        
+                        {preview.type === 'video' && preview.previewUrl && (
+                            <video 
+                                controls 
+                                className="max-w-full max-h-[50vh] rounded-lg border border-border"
+                                src={preview.previewUrl}
+                            >
+                                Browser Anda tidak mendukung video.
+                            </video>
+                        )}
+                        
+                        {preview.type === 'audio' && preview.previewUrl && (
+                            <div className="w-full max-w-md">
+                                <div className="p-4 bg-card rounded-lg border border-border">
+                                    <div className="flex items-center gap-3 mb-3">
+                                        <div className="w-12 h-12 bg-primary/20 rounded flex items-center justify-center">
+                                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                                            </svg>
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                            <p className="text-sm font-medium truncate">{preview.file.name}</p>
+                                            <p className="text-xs text-muted-foreground">Audio File</p>
+                                        </div>
+                                    </div>
+                                    <audio controls className="w-full" src={preview.previewUrl}>
+                                        Browser Anda tidak mendukung audio.
+                                    </audio>
+                                </div>
+                            </div>
+                        )}
+                        
+                        {preview.type === 'file' && (
+                            <div className="w-full max-w-md p-6 bg-card rounded-lg border border-border">
+                                <div className="flex flex-col items-center gap-3">
+                                    <div className="w-20 h-20 bg-primary/20 rounded-lg flex items-center justify-center">
+                                        <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                                        </svg>
+                                    </div>
+                                    <div className="text-center">
+                                        <p className="font-medium text-sm break-all">{preview.file.name}</p>
+                                        <p className="text-xs text-muted-foreground mt-1">
+                                            {(preview.file.size / 1024).toFixed(1)} KB
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+
+                {/* File Info */}
+                <div className="p-4 bg-muted/30 border-t border-border">
+                    <div className="flex items-center justify-between text-xs mb-3">
+                        <span className="text-muted-foreground">Nama File:</span>
+                        <span className="font-medium truncate ml-2 max-w-[60%]">{preview.file.name}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-xs mb-3">
+                        <span className="text-muted-foreground">Ukuran:</span>
+                        <span className="font-medium">{(preview.file.size / 1024).toFixed(2)} KB</span>
+                    </div>
+                    <div className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">Tipe:</span>
+                        <span className="font-medium">{preview.file.type || 'Unknown'}</span>
+                    </div>
+                </div>
+
+                {/* Actions */}
+                <div className="p-4 border-t border-border flex gap-2">
+                    <button
+                        onClick={onCancel}
+                        className="flex-1 h-10 bg-secondary text-secondary-foreground rounded-lg font-medium hover:bg-secondary/80 transition-colors"
+                    >
+                        Batal
+                    </button>
+                    <button
+                        onClick={onSend}
+                        className="flex-1 h-10 bg-primary text-primary-foreground rounded-lg font-medium hover:bg-primary/90 transition-colors flex items-center justify-center gap-2"
+                    >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                        </svg>
+                        Kirim
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 // --- VOICE RECORDER COMPONENT ---
-function VoiceRecorder({ onSend }: { onSend: (blob: Blob) => void }) {
+function VoiceRecorder({ onRecord }: { onRecord: (blob: Blob) => void }) {
     const [isRecording, setIsRecording] = useState(false);
     const [duration, setDuration] = useState(0);
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -240,7 +370,7 @@ function VoiceRecorder({ onSend }: { onSend: (blob: Blob) => void }) {
 
             mediaRecorder.onstop = () => {
                 const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-                onSend(blob);
+                onRecord(blob);
                 stream.getTracks().forEach(track => track.stop());
             };
 
@@ -322,6 +452,7 @@ export default function ChatPage() {
     const [isLoadingTimeout, setIsLoadingTimeout] = useState(false);
     const [uploadingFile, setUploadingFile] = useState(false);
     const [showAttachMenu, setShowAttachMenu] = useState(false);
+    const [filePreview, setFilePreview] = useState<FilePreview | null>(null);
     
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
@@ -530,9 +661,9 @@ export default function ChatPage() {
         }
     };
 
-    // --- FILE HANDLING (REVISED) ---
-    const handleFileUpload = async (file: File, type: MessageType) => {
-        if (!activeChat || !file) return;
+    // --- FILE HANDLING WITH PREVIEW ---
+    const handleFileSelect = (file: File, type: MessageType) => {
+        if (!file) return;
         
         // Validasi ukuran file (max 10MB)
         if (file.size > 10 * 1024 * 1024) {
@@ -540,8 +671,23 @@ export default function ChatPage() {
             return;
         }
 
+        // Create preview URL for images, videos, and audio
+        let previewUrl: string | undefined;
+        if (type === 'image' || type === 'video' || type === 'audio') {
+            previewUrl = URL.createObjectURL(file);
+        }
+
+        setFilePreview({ file, type, previewUrl });
+    };
+
+    const confirmSendFile = async () => {
+        if (!filePreview || !activeChat) return;
+        
         try {
             setUploadingFile(true);
+            setFilePreview(null); // Close preview
+            
+            const { file, type } = filePreview;
             
             // Read file as ArrayBuffer
             const arrayBuffer = await file.arrayBuffer();
@@ -558,7 +704,7 @@ export default function ChatPage() {
             const encryptedBlob = new Blob([encryptedArray], { type: 'application/octet-stream' });
             const encryptedFile = new File([encryptedBlob], `encrypted_${file.name}`, { type: 'application/octet-stream' });
             
-            // Prepare metadata (NOT including file data, just info)
+            // Prepare metadata
             const metadata: FileMetadata = {
                 filename: file.name,
                 mimeType: file.type,
@@ -585,12 +731,23 @@ export default function ChatPage() {
             alert("Gagal mengirim file: " + (err as Error).message);
         } finally {
             setUploadingFile(false);
+            // Cleanup preview URL
+            if (filePreview.previewUrl) {
+                URL.revokeObjectURL(filePreview.previewUrl);
+            }
         }
     };
 
-    const handleVoiceMessage = async (blob: Blob) => {
+    const cancelFilePreview = () => {
+        if (filePreview?.previewUrl) {
+            URL.revokeObjectURL(filePreview.previewUrl);
+        }
+        setFilePreview(null);
+    };
+
+    const handleVoiceRecord = (blob: Blob) => {
         const file = new File([blob], `voice_${Date.now()}.webm`, { type: 'audio/webm' });
-        await handleFileUpload(file, 'audio');
+        handleFileSelect(file, 'audio');
     };
 
     const addFriend = async (e: React.FormEvent) => {
@@ -610,26 +767,47 @@ export default function ChatPage() {
 
     return (
         <div className="flex h-screen bg-background text-foreground overflow-hidden border-t border-border">
+            {/* File Preview Modal */}
+            {filePreview && (
+                <FilePreviewModal
+                    preview={filePreview}
+                    onSend={confirmSendFile}
+                    onCancel={cancelFilePreview}
+                />
+            )}
+
             {/* Hidden file inputs */}
             <input
                 ref={imageInputRef}
                 type="file"
                 accept="image/*"
                 className="hidden"
-                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0], 'image')}
+                onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleFileSelect(file, 'image');
+                    e.target.value = ''; // Reset input
+                }}
             />
             <input
                 ref={videoInputRef}
                 type="file"
                 accept="video/*"
                 className="hidden"
-                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0], 'video')}
+                onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleFileSelect(file, 'video');
+                    e.target.value = ''; // Reset input
+                }}
             />
             <input
                 ref={fileInputRef}
                 type="file"
                 className="hidden"
-                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0], 'file')}
+                onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleFileSelect(file, 'file');
+                    e.target.value = ''; // Reset input
+                }}
             />
 
             <div className={`fixed inset-0 bg-black/50 z-40 md:hidden ${isSidebarOpen ? 'block' : 'hidden'}`} onClick={() => setIsSidebarOpen(false)} />
@@ -803,7 +981,7 @@ export default function ChatPage() {
                                 </div>
 
                                 {/* Voice recorder */}
-                                <VoiceRecorder onSend={handleVoiceMessage} />
+                                <VoiceRecorder onRecord={handleVoiceRecord} />
                                 
                                 {/* Text input */}
                                 <input 

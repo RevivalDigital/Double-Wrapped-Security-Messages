@@ -11,6 +11,15 @@ const KEY1 = process.env.NEXT_PUBLIC_KEY1 || "";
 const KEY2 = process.env.NEXT_PUBLIC_KEY2 || "";
 const INTERNAL_APP_KEY = KEY1 + KEY2;
 
+// --- TYPE DEFINITIONS ---
+type MessageType = 'text' | 'image' | 'video' | 'audio' | 'file';
+
+interface FileMetadata {
+    filename: string;
+    mimeType: string;
+    size: number;
+}
+
 // --- GCM HELPER FUNCTIONS ---
 async function getCryptoKey(rawKey: string) {
     const enc = new TextEncoder();
@@ -38,7 +47,7 @@ async function decryptGCM(base64Data: string, secretKey: string) {
         const decrypted = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
         return new TextDecoder().decode(decrypted);
     } catch (e) {
-        // Fallback untuk pesan lama (non-GCM) jika masih ada di database
+        // Fallback untuk pesan lama (non-GCM)
         try {
             const bytes = CryptoJS.AES.decrypt(base64Data, secretKey);
             const originalText = bytes.toString(CryptoJS.enc.Utf8);
@@ -49,6 +58,25 @@ async function decryptGCM(base64Data: string, secretKey: string) {
     }
 }
 
+// --- FILE ENCRYPTION FUNCTIONS (Simplified) ---
+async function encryptFileData(arrayBuffer: ArrayBuffer, secretKey: string): Promise<string> {
+    const key = await getCryptoKey(secretKey);
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, arrayBuffer);
+    const combined = new Uint8Array(iv.length + encrypted.byteLength);
+    combined.set(iv);
+    combined.set(new Uint8Array(encrypted), iv.length);
+    return btoa(String.fromCharCode(...combined));
+}
+
+async function decryptFileData(base64Data: string, secretKey: string): Promise<ArrayBuffer> {
+    const key = await getCryptoKey(secretKey);
+    const combined = new Uint8Array(atob(base64Data).split("").map(c => c.charCodeAt(0)));
+    const iv = combined.slice(0, 12);
+    const data = combined.slice(12);
+    return await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
+}
+
 // --- SUB-COMPONENT UNTUK DISPLAY TEXT ---
 function DecryptedMessage({ text, secretKey }: { text: string; secretKey: string }) {
     const [decrypted, setDecrypted] = useState("...");
@@ -56,6 +84,226 @@ function DecryptedMessage({ text, secretKey }: { text: string; secretKey: string
         decryptGCM(text, secretKey).then(setDecrypted);
     }, [text, secretKey]);
     return <p className="whitespace-pre-wrap break-words">{decrypted}</p>;
+}
+
+// --- SUB-COMPONENT UNTUK DISPLAY FILE ---
+function DecryptedFile({ 
+    message,
+    secretKey, 
+}: { 
+    message: any;
+    secretKey: string; 
+}) {
+    const [fileUrl, setFileUrl] = useState<string>("");
+    const [metadata, setMetadata] = useState<FileMetadata | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(false);
+
+    useEffect(() => {
+        let objectUrl = "";
+        
+        const decrypt = async () => {
+            try {
+                setLoading(true);
+                setError(false);
+                
+                // Decrypt metadata from text field
+                const decryptedMetaStr = await decryptGCM(message.text, secretKey);
+                const meta: FileMetadata = JSON.parse(decryptedMetaStr);
+                setMetadata(meta);
+                
+                // Get file attachment from PocketBase
+                if (!message.file) {
+                    throw new Error("No file attachment");
+                }
+                
+                // Fetch encrypted file
+                const fileUrl = pb.files.getUrl(message, message.file);
+                const response = await fetch(fileUrl);
+                const encryptedBlob = await response.blob();
+                const encryptedArrayBuffer = await encryptedBlob.arrayBuffer();
+                
+                // Decrypt file content
+                const decryptedBuffer = await decryptFileData(
+                    btoa(String.fromCharCode(...new Uint8Array(encryptedArrayBuffer))),
+                    secretKey
+                );
+                
+                const blob = new Blob([decryptedBuffer], { type: meta.mimeType });
+                objectUrl = URL.createObjectURL(blob);
+                setFileUrl(objectUrl);
+                setLoading(false);
+            } catch (err) {
+                console.error("File decryption error:", err);
+                setError(true);
+                setLoading(false);
+            }
+        };
+        
+        decrypt();
+        
+        return () => {
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+        };
+    }, [message, secretKey]);
+
+    if (loading) {
+        return (
+            <div className="flex items-center gap-2 p-3 bg-muted/50 rounded-lg">
+                <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
+                <span className="text-xs">Mendekripsi...</span>
+            </div>
+        );
+    }
+
+    if (error || !metadata) {
+        return (
+            <div className="p-3 bg-destructive/10 rounded-lg">
+                <p className="text-xs text-destructive">⚠️ Gagal mendekripsi file</p>
+            </div>
+        );
+    }
+
+    // Render berdasarkan tipe
+    if (message.type === 'image') {
+        return (
+            <div className="max-w-sm">
+                <img src={fileUrl} alt={metadata.filename} className="rounded-lg w-full h-auto" />
+                <p className="text-[8px] opacity-50 mt-1">{metadata.filename}</p>
+            </div>
+        );
+    }
+
+    if (message.type === 'video') {
+        return (
+            <div className="max-w-md">
+                <video controls className="rounded-lg w-full" src={fileUrl}>
+                    Browser Anda tidak mendukung video.
+                </video>
+                <p className="text-[8px] opacity-50 mt-1">{metadata.filename}</p>
+            </div>
+        );
+    }
+
+    if (message.type === 'audio') {
+        return (
+            <div className="min-w-[280px]">
+                <audio controls className="w-full" src={fileUrl}>
+                    Browser Anda tidak mendukung audio.
+                </audio>
+                <p className="text-[8px] opacity-50 mt-1">{metadata.filename}</p>
+            </div>
+        );
+    }
+
+    // File biasa
+    return (
+        <a 
+            href={fileUrl} 
+            download={metadata.filename}
+            className="flex items-center gap-3 p-3 bg-muted/50 rounded-lg hover:bg-muted transition-colors"
+        >
+            <div className="w-10 h-10 bg-primary/20 rounded flex items-center justify-center">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                </svg>
+            </div>
+            <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium truncate">{metadata.filename}</p>
+                <p className="text-[10px] opacity-50">{(metadata.size / 1024).toFixed(1)} KB</p>
+            </div>
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>
+        </a>
+    );
+}
+
+// --- VOICE RECORDER COMPONENT ---
+function VoiceRecorder({ onSend }: { onSend: (blob: Blob) => void }) {
+    const [isRecording, setIsRecording] = useState(false);
+    const [duration, setDuration] = useState(0);
+    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    const chunksRef = useRef<Blob[]>([]);
+    const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+    const startRecording = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const mediaRecorder = new MediaRecorder(stream);
+            mediaRecorderRef.current = mediaRecorder;
+            chunksRef.current = [];
+
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) chunksRef.current.push(e.data);
+            };
+
+            mediaRecorder.onstop = () => {
+                const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+                onSend(blob);
+                stream.getTracks().forEach(track => track.stop());
+            };
+
+            mediaRecorder.start();
+            setIsRecording(true);
+            setDuration(0);
+            
+            timerRef.current = setInterval(() => {
+                setDuration(prev => prev + 1);
+            }, 1000);
+        } catch (err) {
+            console.error("Mic access denied:", err);
+            alert("Gagal mengakses mikrofon");
+        }
+    };
+
+    const stopRecording = () => {
+        if (mediaRecorderRef.current && isRecording) {
+            mediaRecorderRef.current.stop();
+            setIsRecording(false);
+            if (timerRef.current) clearInterval(timerRef.current);
+        }
+    };
+
+    const cancelRecording = () => {
+        if (mediaRecorderRef.current && isRecording) {
+            mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+            setIsRecording(false);
+            if (timerRef.current) clearInterval(timerRef.current);
+            chunksRef.current = [];
+        }
+    };
+
+    if (!isRecording) {
+        return (
+            <button
+                type="button"
+                onClick={startRecording}
+                className="w-10 h-10 bg-secondary text-secondary-foreground rounded-full flex items-center justify-center hover:bg-secondary/80 transition-colors"
+            >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                </svg>
+            </button>
+        );
+    }
+
+    return (
+        <div className="flex items-center gap-2 bg-destructive/10 px-4 py-2 rounded-full">
+            <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
+            <span className="text-sm font-mono">{Math.floor(duration / 60)}:{(duration % 60).toString().padStart(2, '0')}</span>
+            <button type="button" onClick={cancelRecording} className="ml-2 p-1 hover:bg-destructive/20 rounded">
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+            <button type="button" onClick={stopRecording} className="p-1 bg-primary text-primary-foreground rounded hover:bg-primary/80">
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
+                </svg>
+            </button>
+        </div>
+    );
 }
 
 export default function ChatPage() {
@@ -72,10 +320,15 @@ export default function ChatPage() {
     const [loadingMessages, setLoadingMessages] = useState(false);
     const [loadError, setLoadError] = useState<string | null>(null);
     const [isLoadingTimeout, setIsLoadingTimeout] = useState(false);
+    const [uploadingFile, setUploadingFile] = useState(false);
+    const [showAttachMenu, setShowAttachMenu] = useState(false);
     
     const chatBoxRef = useRef<HTMLDivElement>(null);
     const currentChatKeyRef = useRef<string>("");
     const loadingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    const imageInputRef = useRef<HTMLInputElement>(null);
+    const videoInputRef = useRef<HTMLInputElement>(null);
 
     // --- EXISTING HELPERS ---
     const encryptSalt = (raw: string) => CryptoJS.AES.encrypt(raw, INTERNAL_APP_KEY).toString();
@@ -264,17 +517,80 @@ export default function ChatPage() {
         e.preventDefault();
         if (!inputText.trim() || !activeChat) return;
         try {
-            // --- UPDATE: MENGGUNAKAN ENKRIPSI GCM ---
             const encrypted = await encryptGCM(inputText.trim(), currentChatKeyRef.current);
             await pb.collection('messages').create({ 
                 sender: myUser.id, 
                 receiver: activeChat.id, 
-                text: encrypted 
+                text: encrypted,
+                type: 'text'
             });
             setInputText("");
         } catch (err) {
             console.error("Encryption failed", err);
         }
+    };
+
+    // --- FILE HANDLING (REVISED) ---
+    const handleFileUpload = async (file: File, type: MessageType) => {
+        if (!activeChat || !file) return;
+        
+        // Validasi ukuran file (max 10MB)
+        if (file.size > 10 * 1024 * 1024) {
+            alert("File terlalu besar. Maksimal 10MB");
+            return;
+        }
+
+        try {
+            setUploadingFile(true);
+            
+            // Read file as ArrayBuffer
+            const arrayBuffer = await file.arrayBuffer();
+            
+            // Encrypt file content
+            const encryptedFileData = await encryptFileData(arrayBuffer, currentChatKeyRef.current);
+            
+            // Convert encrypted data back to Blob for upload
+            const encryptedBytes = atob(encryptedFileData);
+            const encryptedArray = new Uint8Array(encryptedBytes.length);
+            for (let i = 0; i < encryptedBytes.length; i++) {
+                encryptedArray[i] = encryptedBytes.charCodeAt(i);
+            }
+            const encryptedBlob = new Blob([encryptedArray], { type: 'application/octet-stream' });
+            const encryptedFile = new File([encryptedBlob], `encrypted_${file.name}`, { type: 'application/octet-stream' });
+            
+            // Prepare metadata (NOT including file data, just info)
+            const metadata: FileMetadata = {
+                filename: file.name,
+                mimeType: file.type,
+                size: file.size
+            };
+            
+            // Encrypt metadata
+            const encryptedMetadata = await encryptGCM(JSON.stringify(metadata), currentChatKeyRef.current);
+            
+            // Create FormData
+            const formData = new FormData();
+            formData.append('sender', myUser.id);
+            formData.append('receiver', activeChat.id);
+            formData.append('text', encryptedMetadata);
+            formData.append('type', type);
+            formData.append('file', encryptedFile);
+            
+            // Send to PocketBase
+            await pb.collection('messages').create(formData);
+            
+            setShowAttachMenu(false);
+        } catch (err) {
+            console.error("File upload failed:", err);
+            alert("Gagal mengirim file: " + (err as Error).message);
+        } finally {
+            setUploadingFile(false);
+        }
+    };
+
+    const handleVoiceMessage = async (blob: Blob) => {
+        const file = new File([blob], `voice_${Date.now()}.webm`, { type: 'audio/webm' });
+        await handleFileUpload(file, 'audio');
     };
 
     const addFriend = async (e: React.FormEvent) => {
@@ -294,6 +610,28 @@ export default function ChatPage() {
 
     return (
         <div className="flex h-screen bg-background text-foreground overflow-hidden border-t border-border">
+            {/* Hidden file inputs */}
+            <input
+                ref={imageInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0], 'image')}
+            />
+            <input
+                ref={videoInputRef}
+                type="file"
+                accept="video/*"
+                className="hidden"
+                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0], 'video')}
+            />
+            <input
+                ref={fileInputRef}
+                type="file"
+                className="hidden"
+                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0], 'file')}
+            />
+
             <div className={`fixed inset-0 bg-black/50 z-40 md:hidden ${isSidebarOpen ? 'block' : 'hidden'}`} onClick={() => setIsSidebarOpen(false)} />
 
             <aside className={`fixed md:relative inset-y-0 left-0 w-80 bg-card border-r border-border flex flex-col z-50 transition-transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
@@ -391,18 +729,101 @@ export default function ChatPage() {
                                 messages.map((m, idx) => (
                                     <div key={m.id || idx} className={`flex ${m.sender === myUser.id ? 'justify-end' : 'justify-start'}`}>
                                         <div className={`max-w-[75%] p-3 rounded-2xl text-sm ${m.sender === myUser.id ? 'bg-primary text-primary-foreground rounded-tr-none' : 'bg-muted rounded-tl-none'}`}>
-                                            {/* --- UPDATE: MENGGUNAKAN COMPONENT DEKRIPSI --- */}
-                                            <DecryptedMessage text={m.text} secretKey={currentChatKeyRef.current} />
+                                            {(!m.type || m.type === 'text') ? (
+                                                <DecryptedMessage text={m.text} secretKey={currentChatKeyRef.current} />
+                                            ) : (
+                                                <DecryptedFile 
+                                                    message={m}
+                                                    secretKey={currentChatKeyRef.current}
+                                                />
+                                            )}
                                             <p className="text-[8px] opacity-50 mt-1 text-right">{new Date(m.created).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</p>
                                         </div>
                                     </div>
                                 ))
                             )}
                         </div>
+                        
                         <form onSubmit={sendMessage} className="p-4 border-t border-border bg-background">
-                            <div className="flex gap-2">
-                                <input value={inputText} onChange={(e) => setInputText(e.target.value)} placeholder="Type a message..." className="flex-1 h-10 bg-muted rounded-full px-4 text-sm outline-none focus:ring-2 focus:ring-primary" />
-                                <button type="submit" className="w-10 h-10 bg-primary text-primary-foreground rounded-full flex items-center justify-center active:scale-95 transition-transform"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg></button>
+                            {uploadingFile && (
+                                <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+                                    <div className="w-3 h-3 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
+                                    <span>Mengenkripsi dan mengirim...</span>
+                                </div>
+                            )}
+                            
+                            <div className="flex gap-2 items-center">
+                                {/* Attach button */}
+                                <div className="relative">
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowAttachMenu(!showAttachMenu)}
+                                        className="w-10 h-10 bg-secondary text-secondary-foreground rounded-full flex items-center justify-center hover:bg-secondary/80 transition-colors"
+                                        disabled={uploadingFile}
+                                    >
+                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
+                                        </svg>
+                                    </button>
+                                    
+                                    {showAttachMenu && (
+                                        <div className="absolute bottom-full left-0 mb-2 bg-popover border border-border rounded-lg shadow-xl p-2 space-y-1 min-w-[160px]">
+                                            <button
+                                                type="button"
+                                                onClick={() => { imageInputRef.current?.click(); setShowAttachMenu(false); }}
+                                                className="w-full flex items-center gap-2 px-3 py-2 hover:bg-accent rounded text-sm"
+                                            >
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                                </svg>
+                                                <span>Gambar</span>
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => { videoInputRef.current?.click(); setShowAttachMenu(false); }}
+                                                className="w-full flex items-center gap-2 px-3 py-2 hover:bg-accent rounded text-sm"
+                                            >
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                                </svg>
+                                                <span>Video</span>
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => { fileInputRef.current?.click(); setShowAttachMenu(false); }}
+                                                className="w-full flex items-center gap-2 px-3 py-2 hover:bg-accent rounded text-sm"
+                                            >
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                                </svg>
+                                                <span>File</span>
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Voice recorder */}
+                                <VoiceRecorder onSend={handleVoiceMessage} />
+                                
+                                {/* Text input */}
+                                <input 
+                                    value={inputText} 
+                                    onChange={(e) => setInputText(e.target.value)} 
+                                    placeholder="Type a message..." 
+                                    className="flex-1 h-10 bg-muted rounded-full px-4 text-sm outline-none focus:ring-2 focus:ring-primary" 
+                                    disabled={uploadingFile}
+                                />
+                                
+                                {/* Send button */}
+                                <button 
+                                    type="submit" 
+                                    className="w-10 h-10 bg-primary text-primary-foreground rounded-full flex items-center justify-center active:scale-95 transition-transform disabled:opacity-50"
+                                    disabled={uploadingFile}
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                                    </svg>
+                                </button>
                             </div>
                         </form>
                     </>

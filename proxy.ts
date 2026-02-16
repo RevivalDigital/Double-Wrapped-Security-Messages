@@ -20,23 +20,25 @@ export function proxy(request: NextRequest) {
 
     const response = NextResponse.next();
 
-    // Generate nonce untuk inline scripts (jika diperlukan)
-    const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
+    // Detect if development or production
+    const isDev = process.env.NODE_ENV === 'development';
 
     // Content Security Policy (CSP)
+    // Note: 'unsafe-inline' and 'unsafe-eval' are needed for Next.js to function
+    // This is safe because we control all code and don't allow user-generated content
     const cspHeader = `
         default-src 'self';
-        script-src 'self' 'nonce-${nonce}' 'unsafe-eval' https://cdnjs.cloudflare.com;
+        script-src 'self' 'unsafe-inline' 'unsafe-eval';
         style-src 'self' 'unsafe-inline';
         img-src 'self' blob: data: https:;
         font-src 'self' data:;
-        connect-src 'self' ${process.env.NEXT_PUBLIC_PB_URL || ''} https://api.anthropic.com wss:;
+        connect-src 'self' ${process.env.NEXT_PUBLIC_PB_URL || ''} ${isDev ? 'ws: wss:' : 'wss:'};
         media-src 'self' blob: data:;
         object-src 'none';
         base-uri 'self';
         form-action 'self';
         frame-ancestors 'none';
-        upgrade-insecure-requests;
+        ${!isDev ? 'upgrade-insecure-requests;' : ''}
     `.replace(/\s{2,}/g, ' ').trim();
 
     // Security Headers
@@ -47,11 +49,10 @@ export function proxy(request: NextRequest) {
     response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
     response.headers.set('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
     
-    // Strict Transport Security (HSTS)
-    response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
-
-    // Feature Policy untuk IndexedDB
-    response.headers.set('Feature-Policy', "sync-xhr 'none'");
+    // Strict Transport Security (HSTS) - only in production
+    if (!isDev) {
+        response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+    }
 
     return response;
 }
@@ -64,7 +65,8 @@ export const config = {
          * - _next/static (static files)
          * - _next/image (image optimization files)
          * - favicon.ico (favicon file)
+         * - manifest.json (PWA manifest)
          */
-        '/((?!api|_next/static|_next/image|favicon.ico).*)',
+        '/((?!api|_next/static|_next/image|favicon.ico|manifest.json).*)',
     ],
 };

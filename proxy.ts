@@ -20,25 +20,23 @@ export function proxy(request: NextRequest) {
 
     const response = NextResponse.next();
 
-    // Detect if development or production
-    const isDev = process.env.NODE_ENV === 'development';
+    // Generate nonce untuk inline scripts
+    const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
 
-    // Content Security Policy (CSP)
-    // Note: 'unsafe-inline' and 'unsafe-eval' are needed for Next.js to function
-    // This is safe because we control all code and don't allow user-generated content
+    // Content Security Policy (CSP) - Compatible dengan Next.js
     const cspHeader = `
         default-src 'self';
-        script-src 'self' 'unsafe-inline' 'unsafe-eval';
+        script-src 'self' 'unsafe-eval' 'unsafe-inline' https://cdnjs.cloudflare.com;
         style-src 'self' 'unsafe-inline';
         img-src 'self' blob: data: https:;
         font-src 'self' data:;
-        connect-src 'self' ${process.env.NEXT_PUBLIC_PB_URL || ''} ${isDev ? 'ws: wss:' : 'wss:'};
+        connect-src 'self' ${process.env.NEXT_PUBLIC_PB_URL || ''} https://api.anthropic.com wss: ws:;
         media-src 'self' blob: data:;
         object-src 'none';
         base-uri 'self';
         form-action 'self';
         frame-ancestors 'none';
-        ${!isDev ? 'upgrade-insecure-requests;' : ''}
+        upgrade-insecure-requests;
     `.replace(/\s{2,}/g, ' ').trim();
 
     // Security Headers
@@ -49,10 +47,11 @@ export function proxy(request: NextRequest) {
     response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
     response.headers.set('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
     
-    // Strict Transport Security (HSTS) - only in production
-    if (!isDev) {
-        response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
-    }
+    // Strict Transport Security (HSTS)
+    response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+
+    // Feature Policy untuk IndexedDB
+    response.headers.set('Feature-Policy', "sync-xhr 'none'");
 
     return response;
 }

@@ -6,7 +6,7 @@ interface MessageListProps {
     messages: any[];
     loading: boolean;
     error: string | null;
-    containerRef: RefObject<HTMLDivElement>;
+    containerRef: RefObject<HTMLDivElement | null>;
     sharedSecret: CryptoKey | null;
 }
 
@@ -41,4 +41,3 @@ export default function MessageList({
         </div>
     );
 }
-

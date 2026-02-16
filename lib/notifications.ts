@@ -23,7 +23,7 @@ export class NotificationManager {
 
     // Check current notification permission
     private checkPermission(): void {
-        if (!('Notification' in window)) {
+        if (typeof window === 'undefined' || !('Notification' in window)) {
             console.warn('This browser does not support notifications');
             return;
         }
@@ -33,7 +33,7 @@ export class NotificationManager {
 
     // Request notification permission
     async requestPermission(): Promise<boolean> {
-        if (!('Notification' in window)) {
+        if (typeof window === 'undefined' || !('Notification' in window)) {
             console.warn('This browser does not support notifications');
             return false;
         }
@@ -63,6 +63,11 @@ export class NotificationManager {
 
     // Show notification
     show(title: string, options?: ExtendedNotificationOptions): Notification | null {
+        if (typeof window === 'undefined' || !('Notification' in window)) {
+            console.warn('Notifications are not available on this platform');
+            return null;
+        }
+
         if (!this.permissionGranted) {
             console.warn('Notification permission not granted');
             return null;
@@ -110,12 +115,15 @@ export class NotificationManager {
 
     // Get permission status
     getPermissionStatus(): NotificationPermission {
+        if (typeof window === 'undefined' || !('Notification' in window)) {
+            return 'default';
+        }
         return Notification.permission;
     }
 
     // Check if notifications are supported
     isSupported(): boolean {
-        return 'Notification' in window;
+        return typeof window !== 'undefined' && 'Notification' in window;
     }
 }
 

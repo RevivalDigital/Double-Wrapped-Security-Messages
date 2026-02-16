@@ -2,37 +2,69 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
 export function middleware(request: NextRequest) {
-  // Ambil cookie PocketBase (Default name is 'pb_auth')
-  // Catatan: Pastikan saat login, Anda menginstruksikan PB untuk menyimpan ke cookie
-  const authCookie = request.cookies.get('pb_auth');
+    // Authentication Check
+    const authCookie = request.cookies.get('pb_auth');
+    const isChatPage = request.nextUrl.pathname === '/';
+    const isLoginPage = request.nextUrl.pathname.startsWith('/login');
+    const isProfilePage = request.nextUrl.pathname.startsWith('/profile');
 
-  // Tentukan rute yang ingin diproteksi (contoh: halaman chat utama)
-  const isChatPage = request.nextUrl.pathname === '/';
-  const isLoginPage = request.nextUrl.pathname.startsWith('/login');
+    // Redirect to login if accessing protected pages without auth
+    if ((isChatPage || isProfilePage) && !authCookie) {
+        return NextResponse.redirect(new URL('/login', request.url));
+    }
 
-  // LOGIKA 1: Jika mencoba akses chat tapi belum login
-  if (isChatPage && !authCookie) {
-    return NextResponse.redirect(new URL('/login', request.url));
-  }
+    // Redirect to home if already logged in and trying to access login
+    if (isLoginPage && authCookie) {
+        return NextResponse.redirect(new URL('/', request.url));
+    }
 
-  // LOGIKA 2: Jika sudah login tapi mencoba ke halaman login lagi
-  if (isLoginPage && authCookie) {
-    return NextResponse.redirect(new URL('/', request.url));
-  }
+    const response = NextResponse.next();
 
-  return NextResponse.next();
+    // Generate nonce untuk inline scripts
+    const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
+
+    // Content Security Policy (CSP)
+    const cspHeader = `
+        default-src 'self';
+        script-src 'self' 'nonce-${nonce}' 'unsafe-eval' https://cdnjs.cloudflare.com;
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' blob: data: https:;
+        font-src 'self' data:;
+        connect-src 'self' ${process.env.NEXT_PUBLIC_PB_URL || ''} https://api.anthropic.com wss:;
+        media-src 'self' blob: data:;
+        object-src 'none';
+        base-uri 'self';
+        form-action 'self';
+        frame-ancestors 'none';
+        upgrade-insecure-requests;
+    `.replace(/\s{2,}/g, ' ').trim();
+
+    // Security Headers
+    response.headers.set('Content-Security-Policy', cspHeader);
+    response.headers.set('X-Content-Type-Options', 'nosniff');
+    response.headers.set('X-Frame-Options', 'DENY');
+    response.headers.set('X-XSS-Protection', '1; mode=block');
+    response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+    response.headers.set('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
+    
+    // Strict Transport Security (HSTS)
+    response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+
+    // Feature Policy untuk IndexedDB
+    response.headers.set('Feature-Policy', "sync-xhr 'none'");
+
+    return response;
 }
 
-// Konfigurasi rute mana saja yang akan diperiksa oleh middleware
 export const config = {
-  matcher: [
-    /*
-     * Cocokkan semua request rute kecuali:
-     * - api (rute API)
-     * - _next/static (file statis)
-     * - _next/image (optimasi gambar)
-     * - favicon.ico (icon)
-     */
-    '/((?!api|_next/static|_next/image|favicon.ico).*)',
-  ],
+    matcher: [
+        /*
+         * Match all request paths except for the ones starting with:
+         * - api (API routes)
+         * - _next/static (static files)
+         * - _next/image (image optimization files)
+         * - favicon.ico (favicon file)
+         */
+        '/((?!api|_next/static|_next/image|favicon.ico).*)',
+    ],
 };

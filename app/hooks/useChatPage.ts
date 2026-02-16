@@ -150,21 +150,37 @@ class SecureIndexedDB {
         if (!this.db) throw new Error('Database not initialized');
 
         return new Promise((resolve, reject) => {
-            const tx = this.db!.transaction(['messages'], 'readwrite');
-            const store = tx.objectStore('messages');
-            const index = store.index('userId');
-            const request = index.openCursor(IDBKeyRange.only(userId));
+            const tx = this.db!.transaction(['keyPairs', 'messages', 'sharedSecrets'], 'readwrite');
 
-            request.onsuccess = (event) => {
-                const cursor = (event.target as IDBRequest).result;
-                if (cursor) {
-                    cursor.delete();
-                    cursor.continue();
-                } else {
-                    resolve();
-                }
-            };
-            request.onerror = () => reject(request.error);
+            const keyStore = tx.objectStore('keyPairs');
+            try {
+                keyStore.delete(userId);
+            } catch {
+            }
+
+            const msgStore = tx.objectStore('messages');
+            try {
+                const index = msgStore.index('userId');
+                const request = index.openCursor(IDBKeyRange.only(userId));
+
+                request.onsuccess = (event) => {
+                    const cursor = (event.target as IDBRequest).result;
+                    if (cursor) {
+                        cursor.delete();
+                        cursor.continue();
+                    }
+                };
+            } catch {
+            }
+
+            const secretStore = tx.objectStore('sharedSecrets');
+            try {
+                secretStore.clear();
+            } catch {
+            }
+
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
         });
     }
 
@@ -377,6 +393,7 @@ export default function useChatPage() {
     const [showNoti, setShowNoti] = useState(false);
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
     const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+    const [friendNotification, setFriendNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
     const [loadingMessages, setLoadingMessages] = useState(false);
     const [loadError, setLoadError] = useState<string | null>(null);
     const [uploadingFile, setUploadingFile] = useState(false);
@@ -603,9 +620,6 @@ export default function useChatPage() {
     };
 
     const removeFriend = async (friendRecordId: string) => {
-        const confirmDelete = window.confirm('Hapus pertemanan ini?');
-        if (!confirmDelete) return;
-
         try {
             const record = friends.find(f => f.id === friendRecordId);
 
@@ -630,11 +644,15 @@ export default function useChatPage() {
                 setMessages([]);
             }
 
-            alert('Pertemanan berhasil dihapus.');
+            setFriendNotification({ type: 'success', message: 'Pertemanan berhasil dihapus.' });
         } catch (err) {
             console.error(err);
-            alert('Gagal menghapus pertemanan.');
+            setFriendNotification({ type: 'error', message: 'Gagal menghapus pertemanan.' });
         }
+    };
+
+    const clearFriendNotification = () => {
+        setFriendNotification(null);
     };
 
     const triggerLocalNotification = (name: string) => {
@@ -877,7 +895,7 @@ export default function useChatPage() {
         e.preventDefault();
         const input = searchId.trim();
         if (!input) {
-            alert("ID tidak valid.");
+            setFriendNotification({ type: 'error', message: "ID tidak valid." });
             return;
         }
 
@@ -887,14 +905,14 @@ export default function useChatPage() {
             });
 
             if (userList.items.length === 0) {
-                alert("User tidak ditemukan.");
+                setFriendNotification({ type: 'error', message: "User tidak ditemukan." });
                 return;
             }
 
             const targetUser = userList.items[0];
 
             if (targetUser.id === myUser.id) {
-                alert("Tidak bisa menambahkan diri sendiri.");
+                setFriendNotification({ type: 'error', message: "Tidak bisa menambahkan diri sendiri." });
                 return;
             }
 
@@ -906,15 +924,15 @@ export default function useChatPage() {
                 const relation = existing[0];
 
                 if (relation.status === 'accepted') {
-                    alert("Kalian sudah berteman.");
+                    setFriendNotification({ type: 'info', message: "Kalian sudah berteman." });
                     return;
                 }
 
                 if (relation.status === 'pending') {
                     if (relation.user === myUser.id) {
-                        alert("Permintaan sudah dikirim, menunggu konfirmasi.");
+                        setFriendNotification({ type: 'info', message: "Permintaan sudah dikirim, menunggu konfirmasi." });
                     } else {
-                        alert("Pengguna ini sudah mengirim permintaan, cek permintaan pertemanan.");
+                        setFriendNotification({ type: 'info', message: "Pengguna ini sudah mengirim permintaan, cek permintaan pertemanan." });
                     }
                     return;
                 }
@@ -926,10 +944,10 @@ export default function useChatPage() {
                 status: 'pending'
             });
 
-            alert("Permintaan terkirim!");
+            setFriendNotification({ type: 'success', message: "Permintaan terkirim!" });
             setSearchId("");
         } catch (err) {
-            alert("Gagal kirim permintaan.");
+            setFriendNotification({ type: 'error', message: "Gagal kirim permintaan." });
         }
     };
 
@@ -987,6 +1005,8 @@ export default function useChatPage() {
         addFriend,
         handleClearCache,
         respondRequest,
-        removeFriend
+        removeFriend,
+        friendNotification,
+        clearFriendNotification
     };
 }

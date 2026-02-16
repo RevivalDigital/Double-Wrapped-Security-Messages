@@ -133,11 +133,37 @@ export default function ProfilePage() {
         }
     };
 
-    const handleLogout = () => {
-        if (confirm("Logout dari akun ini?")) {
-            pb.authStore.clear();
-            router.push("/login");
+    const handleLogout = async () => {
+        if (!confirm("Logout dari akun ini?")) return;
+
+        try {
+            if (typeof window !== "undefined") {
+                try {
+                    Object.keys(window.localStorage).forEach((k) => {
+                        if (user?.id && k.startsWith(`chat_${user.id}_`)) {
+                            window.localStorage.removeItem(k);
+                        }
+                    });
+                } catch {
+                }
+            }
+
+            if (typeof indexedDB !== "undefined") {
+                try {
+                    indexedDB.deleteDatabase("BitlabSecureChat");
+                } catch {
+                }
+
+                try {
+                    indexedDB.deleteDatabase("e2ee-db");
+                } catch {
+                }
+            }
+        } catch {
         }
+
+        pb.authStore.clear();
+        router.push("/login");
     };
 
     const copyUserId = () => {

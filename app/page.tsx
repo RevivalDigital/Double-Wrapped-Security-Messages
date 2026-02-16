@@ -948,6 +948,11 @@ export default function ChatPage() {
                 }
 
                 const user = pb.authStore.model;
+                if (!user) {
+                    window.location.href = "/login";
+                    return;
+                }
+                
                 setMyUser(user);
 
                 // Check if user has existing key pair in IndexedDB

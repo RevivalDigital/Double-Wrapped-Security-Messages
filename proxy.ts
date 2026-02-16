@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
     // Authentication Check
     const authCookie = request.cookies.get('pb_auth');
     const isChatPage = request.nextUrl.pathname === '/';
@@ -20,7 +20,7 @@ export function middleware(request: NextRequest) {
 
     const response = NextResponse.next();
 
-    // Generate nonce untuk inline scripts
+    // Generate nonce untuk inline scripts (jika diperlukan)
     const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
 
     // Content Security Policy (CSP)

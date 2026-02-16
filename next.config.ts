@@ -36,11 +36,7 @@ const nextConfig = {
   // Enable React Strict Mode for better development experience
   reactStrictMode: true,
   // Disable x-powered-by header
-  poweredByHeader: false,
-  // Add empty turbopack config to silence the warning
-  experimental: {
-    turbopack: {}
-  }
+  poweredByHeader: false
 }
 
 module.exports = nextConfig

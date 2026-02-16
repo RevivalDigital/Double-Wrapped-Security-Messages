@@ -4,9 +4,9 @@ interface AttachMenuProps {
     show: boolean;
     setShow: Dispatch<SetStateAction<boolean>>;
     uploadingFile: boolean;
-    fileInputRef: RefObject<HTMLInputElement>;
-    imageInputRef: RefObject<HTMLInputElement>;
-    videoInputRef: RefObject<HTMLInputElement>;
+    fileInputRef: RefObject<HTMLInputElement | null>;
+    imageInputRef: RefObject<HTMLInputElement | null>;
+    videoInputRef: RefObject<HTMLInputElement | null>;
 }
 
 export default function AttachMenu({
@@ -67,4 +67,3 @@ export default function AttachMenu({
         </div>
     );
 }
-

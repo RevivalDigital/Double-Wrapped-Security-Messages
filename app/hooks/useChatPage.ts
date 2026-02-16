@@ -952,14 +952,18 @@ export default function useChatPage() {
     };
 
     const handleClearCache = async () => {
-        if (confirm('Hapus semua cache pesan?')) {
-            try {
-                await secureDB.clearAllMessages(myUser.id);
-                alert("Cache berhasil dihapus");
-            } catch (err) {
-                console.error(err);
-                alert("Gagal menghapus cache");
-            }
+        try {
+            await secureDB.clearAllMessages(myUser.id);
+            setFriendNotification({
+                type: 'success',
+                message: 'Cache pesan dan kunci lokal di perangkat ini telah dihapus.',
+            });
+        } catch (err) {
+            console.error(err);
+            setFriendNotification({
+                type: 'error',
+                message: 'Gagal menghapus cache lokal.',
+            });
         }
     };
 

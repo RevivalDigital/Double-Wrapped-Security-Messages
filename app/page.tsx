@@ -1130,6 +1130,8 @@ export default function ChatPage() {
     } = useChatPageHook();
 
     const [unfriendTargetId, setUnfriendTargetId] = useState<string | null>(null);
+    const [showClearCacheModal, setShowClearCacheModal] = useState(false);
+    const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
 
     const unfriendTarget = unfriendTargetId
         ? friends.find(f => f.id === unfriendTargetId)
@@ -1242,9 +1244,10 @@ export default function ChatPage() {
                 setShowNoti={setShowNoti}
                 onAddFriend={addFriend}
                 onSelectChat={selectChat}
-                onClearCache={handleClearCache}
+                onClearCache={() => setShowClearCacheModal(true)}
                 respondRequest={respondRequest}
                 onRemoveFriend={(id) => setUnfriendTargetId(id)}
+                onLogout={() => setShowLogoutConfirm(true)}
             />
 
             <main className="flex-1 flex flex-col bg-background">
@@ -1277,6 +1280,102 @@ export default function ChatPage() {
                             imageInputRef={imageInputRef}
                             videoInputRef={videoInputRef}
                         />
+                        {showClearCacheModal && (
+                            <div className="fixed inset-0 bg-black/70 z-[170] flex items-center justify-center px-4">
+                                <div className="bg-card border border-border rounded-lg max-w-sm w-full p-5">
+                                    <h2 className="text-sm font-bold mb-2">Hapus semua cache pesan?</h2>
+                                    <p className="text-xs text-muted-foreground mb-3">
+                                        Tindakan ini akan menghapus semua pesan yang tersimpan offline dan kunci
+                                        enkripsi lokal di perangkat ini.
+                                    </p>
+                                    <p className="text-xs text-amber-500 font-semibold mb-4">
+                                        Setelah ini, Anda perlu memasukkan ulang Passphrase backup untuk memulihkan
+                                        kunci dan membaca chat lama di perangkat ini.
+                                    </p>
+                                    <div className="flex justify-end gap-2 text-xs">
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowClearCacheModal(false)}
+                                            className="h-8 px-3 rounded-md bg-muted hover:bg-muted/80"
+                                        >
+                                            Batal
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={async () => {
+                                                await handleClearCache();
+                                                setShowClearCacheModal(false);
+                                            }}
+                                            className="h-8 px-3 rounded-md bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                        >
+                                            Hapus cache
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {showLogoutConfirm && (
+                            <div className="fixed inset-0 bg-black/70 z-[175] flex items-center justify-center px-4">
+                                <div className="bg-card border border-border rounded-lg max-w-sm w-full p-5">
+                                    <h2 className="text-sm font-bold mb-2">Logout dan hapus data lokal?</h2>
+                                    <p className="text-xs text-muted-foreground mb-3">
+                                        Tindakan ini akan menghapus semua pesan yang tersimpan offline dan kunci
+                                        enkripsi lokal di perangkat ini, lalu mengeluarkan Anda dari akun.
+                                    </p>
+                                    <p className="text-xs text-amber-500 font-semibold mb-4">
+                                        Setelah login kembali, Anda perlu memasukkan ulang Passphrase backup untuk
+                                        memulihkan kunci dan membaca chat lama di perangkat ini.
+                                    </p>
+                                    <div className="flex justify-end gap-2 text-xs">
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowLogoutConfirm(false)}
+                                            className="h-8 px-3 rounded-md bg-muted hover:bg-muted/80"
+                                        >
+                                            Batal
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={async () => {
+                                                try {
+                                                    if (typeof window !== "undefined") {
+                                                        try {
+                                                            Object.keys(window.localStorage).forEach((k) => {
+                                                                if (myUser?.id && k.startsWith(`chat_${myUser.id}_`)) {
+                                                                    window.localStorage.removeItem(k);
+                                                                }
+                                                            });
+                                                        } catch {
+                                                        }
+                                                    }
+
+                                                    if (typeof indexedDB !== "undefined") {
+                                                        try {
+                                                            indexedDB.deleteDatabase("BitlabSecureChat");
+                                                        } catch {
+                                                        }
+
+                                                        try {
+                                                            indexedDB.deleteDatabase("e2ee-db");
+                                                        } catch {
+                                                        }
+                                                    }
+                                                } catch {
+                                                }
+
+                                                pb.authStore.clear();
+                                                window.location.href = "/login";
+                                            }}
+                                            className="h-8 px-3 rounded-md bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                        >
+                                            Logout sekarang
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
                         {unfriendTarget && (
                             <div className="fixed inset-0 bg-black/60 z-[170] flex items-center justify-center px-4">
                                 <div className="bg-card border border-border rounded-lg max-w-sm w-full p-5">

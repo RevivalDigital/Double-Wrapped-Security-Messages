@@ -19,6 +19,7 @@ interface SidebarProps {
     onClearCache: () => void;
     respondRequest: (id: string, action: 'accepted' | 'reject') => void;
     onRemoveFriend: (friendRecordId: string) => void;
+    onLogout: () => void;
 }
 
 export default function Sidebar({
@@ -37,7 +38,8 @@ export default function Sidebar({
     onSelectChat,
     onClearCache,
     respondRequest,
-    onRemoveFriend
+    onRemoveFriend,
+    onLogout
 }: SidebarProps) {
     return (
         <aside className={`fixed md:relative inset-y-0 left-0 w-80 bg-card border-r border-border flex flex-col z-50 transition-transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
@@ -123,6 +125,7 @@ export default function Sidebar({
                 user={myUser}
                 onProfile={() => { window.location.href = "/profile"; }}
                 onClearCache={onClearCache}
+                onLogout={onLogout}
             />
         </aside>
     );

@@ -1,40 +1,46 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
-  /* Enable React Strict Mode for better development experience */
-  reactStrictMode: true,
-
-  /* Experimental features for better performance */
-  experimental: {
-    // Enable turbopack for faster builds (Next.js 16+)
-    turbo: {
-      // Configure turbopack if needed
-    },
-  },
-
-  /* Image optimization configuration */
-  images: {
-    remotePatterns: [
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  async headers() {
+    return [
       {
-        protocol: 'https',
-        hostname: '**', // Allow images from PocketBase
-      },
-    ],
+        source: '/:path*',
+        headers: [
+          {
+            key: 'X-DNS-Prefetch-Control',
+            value: 'on'
+          },
+          {
+            key: 'X-Frame-Options',
+            value: 'DENY'
+          },
+          {
+            key: 'X-Content-Type-Options',
+            value: 'nosniff'
+          },
+          {
+            key: 'X-XSS-Protection',
+            value: '1; mode=block'
+          },
+          {
+            key: 'Referrer-Policy',
+            value: 'strict-origin-when-cross-origin'
+          },
+          {
+            key: 'Permissions-Policy',
+            value: 'camera=(), microphone=(self), geolocation=(), payment=(), usb=()'
+          }
+        ]
+      }
+    ]
   },
+  // Enable React Strict Mode for better development experience
+  reactStrictMode: true,
+  // Disable x-powered-by header
+  poweredByHeader: false,
+  // Add empty turbopack config to silence the warning
+  experimental: {
+    turbopack: {}
+  }
+}
 
-  /* Webpack configuration for better bundle size */
-  webpack: (config) => {
-    // Optimize bundle size by excluding unnecessary dependencies
-    config.resolve.alias = {
-      ...config.resolve.alias,
-    };
-    return config;
-  },
-
-  /* Environment variables to expose to the client */
-  env: {
-    NEXT_PUBLIC_PB_URL: process.env.NEXT_PUBLIC_PB_URL,
-  },
-};
-
-export default nextConfig;
+module.exports = nextConfig

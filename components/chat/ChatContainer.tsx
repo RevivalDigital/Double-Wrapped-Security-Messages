@@ -9,7 +9,7 @@ interface ChatContainerProps {
     messages: any[];
     loadingMessages: boolean;
     loadError: string | null;
-    chatBoxRef: RefObject<HTMLDivElement>;
+    chatBoxRef: RefObject<HTMLDivElement | null>;
     currentSharedSecretRef: RefObject<CryptoKey | null>;
     inputText: string;
     setInputText: Dispatch<SetStateAction<string>>;
@@ -71,4 +71,3 @@ export default function ChatContainer({
         </>
     );
 }
-

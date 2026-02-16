@@ -1,6 +1,10 @@
 // Notification Helper Utility
 // Handles browser notifications with proper permission management
 
+type ExtendedNotificationOptions = NotificationOptions & {
+    vibrate?: number[];
+};
+
 export class NotificationManager {
     private static instance: NotificationManager;
     private permissionGranted: boolean = false;
@@ -64,13 +68,15 @@ export class NotificationManager {
         }
 
         try {
-            const notification = new Notification(title, {
+            const baseOptions: ExtendedNotificationOptions = {
                 icon: '/icon-192.png',
                 badge: '/icon-96.png',
                 vibrate: [200, 100, 200],
                 requireInteraction: false,
                 ...options
-            });
+            };
+
+            const notification = new Notification(title, baseOptions);
 
             // Auto-close after 5 seconds
             setTimeout(() => notification.close(), 5000);

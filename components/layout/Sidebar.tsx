@@ -18,6 +18,8 @@ interface SidebarProps {
     onSelectChat: (friendRecord: any) => void;
     onClearCache: () => void;
     respondRequest: (id: string, action: 'accepted' | 'reject') => void;
+    onRemoveFriend: (friendRecordId: string) => void;
+    onLogout: () => void;
 }
 
 export default function Sidebar({
@@ -35,7 +37,9 @@ export default function Sidebar({
     onAddFriend,
     onSelectChat,
     onClearCache,
-    respondRequest
+    respondRequest,
+    onRemoveFriend,
+    onLogout
 }: SidebarProps) {
     return (
         <aside className={`fixed md:relative inset-y-0 left-0 w-80 bg-card border-r border-border flex flex-col z-50 transition-transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
@@ -78,30 +82,41 @@ export default function Sidebar({
                     const friendData = f.user === myUser.id ? f.expand?.friend : f.expand?.user;
                     const unread = unreadCounts[friendData?.id] || 0;
                     return (
-                        <button
+                        <div
                             key={f.id}
-                            onClick={() => onSelectChat(f)}
                             className={`w-full p-2 flex items-center gap-3 rounded-md transition-all ${activeChat?.id === friendData?.id ? 'bg-accent' : 'hover:bg-accent/40'}`}
                         >
-                            <div className="relative">
-                                <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">
-                                    {(friendData?.name || 'U')[0].toUpperCase()}
+                            <button
+                                onClick={() => onSelectChat(f)}
+                                className="flex items-center gap-3 flex-1 text-left"
+                            >
+                                <div className="relative">
+                                    <div className="w-10 h-10 rounded-full bg-muted flex items-center justify-center font-bold text-xs border border-border">
+                                        {(friendData?.name || 'U')[0].toUpperCase()}
+                                    </div>
+                                    {unread > 0 && (
+                                        <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] font-bold px-1 border-2 border-card">
+                                            {unread}
+                                        </span>
+                                    )}
                                 </div>
-                                {unread > 0 && (
-                                    <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] font-bold px-1 border-2 border-card">
-                                        {unread}
-                                    </span>
-                                )}
-                            </div>
-                            <div className="text-left truncate flex-1">
-                                <div className="text-sm font-semibold truncate">
-                                    {friendData?.name || friendData?.email}
+                                <div className="text-left truncate flex-1">
+                                    <div className="text-sm font-semibold truncate">
+                                        {friendData?.name || friendData?.email}
+                                    </div>
+                                    <p className={`text-[10px] font-bold ${unread > 0 ? 'text-red-500' : 'text-emerald-500'}`}>
+                                        {unread > 0 ? `${unread} pesan baru` : 'E2EE Active'}
+                                    </p>
                                 </div>
-                                <p className={`text-[10px] font-bold ${unread > 0 ? 'text-red-500' : 'text-emerald-500'}`}>
-                                    {unread > 0 ? `${unread} pesan baru` : 'E2EE Active'}
-                                </p>
-                            </div>
-                        </button>
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => onRemoveFriend(f.id)}
+                                className="px-2 py-1 text-[10px] rounded-md bg-destructive/10 text-destructive hover:bg-destructive hover:text-destructive-foreground"
+                            >
+                                Hapus
+                            </button>
+                        </div>
                     );
                 })}
             </div>
@@ -110,8 +125,8 @@ export default function Sidebar({
                 user={myUser}
                 onProfile={() => { window.location.href = "/profile"; }}
                 onClearCache={onClearCache}
+                onLogout={onLogout}
             />
         </aside>
     );
 }
-

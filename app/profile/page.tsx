@@ -133,11 +133,37 @@ export default function ProfilePage() {
         }
     };
 
-    const handleLogout = () => {
-        if (confirm("Logout dari akun ini?")) {
-            pb.authStore.clear();
-            router.push("/login");
+    const [showLogoutModal, setShowLogoutModal] = useState(false);
+
+    const handleLogout = async () => {
+        try {
+            if (typeof window !== "undefined") {
+                try {
+                    Object.keys(window.localStorage).forEach((k) => {
+                        if (user?.id && k.startsWith(`chat_${user.id}_`)) {
+                            window.localStorage.removeItem(k);
+                        }
+                    });
+                } catch {
+                }
+            }
+
+            if (typeof indexedDB !== "undefined") {
+                try {
+                    indexedDB.deleteDatabase("BitlabSecureChat");
+                } catch {
+                }
+
+                try {
+                    indexedDB.deleteDatabase("e2ee-db");
+                } catch {
+                }
+            }
+        } catch {
         }
+
+        pb.authStore.clear();
+        router.push("/login");
     };
 
     const copyUserId = () => {
@@ -338,13 +364,12 @@ export default function ProfilePage() {
                     </button>
                 </form>
 
-                {/* Danger Zone */}
                 <div className="bg-card border border-destructive/20 rounded-lg p-6 space-y-4">
                     <h2 className="text-lg font-bold text-destructive mb-4">Danger Zone</h2>
                     
                     <div className="space-y-2">
                         <button 
-                            onClick={handleLogout}
+                            onClick={() => setShowLogoutModal(true)}
                             className="w-full h-11 bg-destructive text-destructive-foreground rounded-md text-sm font-bold hover:opacity-90 transition-opacity flex items-center justify-center gap-2"
                         >
                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -352,11 +377,47 @@ export default function ProfilePage() {
                             </svg>
                             Logout
                         </button>
-                        <p className="text-xs text-muted-foreground text-center">You will be signed out of your account</p>
+                        <p className="text-xs text-muted-foreground text-center">
+                            Anda akan keluar dan data lokal perangkat akan dibersihkan.
+                        </p>
                     </div>
                 </div>
 
-                {/* Footer Info */}
+                {showLogoutModal && (
+                    <div className="fixed inset-0 bg-black/70 z-[180] flex items-center justify-center px-4">
+                        <div className="bg-card border border-border rounded-lg max-w-sm w-full p-5">
+                            <h2 className="text-sm font-bold mb-2">Logout dan hapus data lokal?</h2>
+                            <p className="text-xs text-muted-foreground mb-3">
+                                Tindakan ini akan menghapus semua pesan yang tersimpan offline dan kunci enkripsi
+                                lokal di perangkat ini, lalu mengeluarkan Anda dari akun.
+                            </p>
+                            <p className="text-xs text-amber-500 font-semibold mb-4">
+                                Setelah login kembali, Anda perlu memasukkan ulang Passphrase backup untuk memulihkan
+                                kunci dan membaca chat lama di perangkat ini.
+                            </p>
+                            <div className="flex justify-end gap-2 text-xs">
+                                <button
+                                    type="button"
+                                    onClick={() => setShowLogoutModal(false)}
+                                    className="h-8 px-3 rounded-md bg-muted hover:bg-muted/80"
+                                >
+                                    Batal
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={async () => {
+                                        await handleLogout();
+                                        setShowLogoutModal(false);
+                                    }}
+                                    className="h-8 px-3 rounded-md bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                >
+                                    Logout sekarang
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
                 <div className="text-center py-8">
                     <p className="text-xs text-muted-foreground">
                         Bitlab Chat • End-to-End Encrypted Messaging
